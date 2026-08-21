@@ -65,10 +65,11 @@ use Tests\TestCase;
  * pertenece el turno, con qué integración se manda y a qué conversación. Eso se
  * resuelve de a lote o no se resuelve.
  *
- * ⚠️ **Un N+1 de HTTP que este archivo no afirma.** Midiendo apareció que
- * `EnviarRecordatorios` le pega a Google **una vez por turno**
+ * ⚠️ **Un N+1 de HTTP que este archivo no afirma.** Medido: cinco turnos de la
+ * misma PyME en la misma ventana son **cinco peticiones a Google**, una por turno
  * (`eventoSigueExistiendo`), contra una cuota de terceros y sumando latencia real
- * —RNF-04 ya se mide en 2.361 ms p95—. `ConciliarAgendamientos` resolvió el mismo
+ * —RNF-04 ya se mide en 2.361 ms p95—. Las cinco a Meta sí son inevitables: es un
+ * mensaje por cliente. `ConciliarAgendamientos` resolvió el mismo
  * problema con **un listado por PyME**, así que hay precedente. No lo fijo en un
  * test porque cambiar de `GET` por turno a listado por PyME **cambia qué se
  * verifica** (el listado filtra por `origen`, el `GET` no), y eso es una decisión

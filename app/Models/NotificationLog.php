@@ -62,6 +62,32 @@ class NotificationLog extends Model
         self::ESTADO_FALLIDO,
     ];
 
+    /**
+     * T-039 · Hasta donde llego el mensaje, del escalon mas bajo al mas alto.
+     *
+     * Meta **no garantiza el orden** de los acuses: un `delivered` demorado
+     * puede aterrizar despues del `read`. Este ranking es lo que decide si un
+     * estado entrante hace avanzar la fila o se descarta, para que nunca
+     * retroceda.
+     *
+     * `queued` es nuestro y Meta no lo conoce, pero entra igual: es el escalon
+     * del que arranca toda notificacion recien creada, y sin el un `sent`
+     * legitimo no tendria contra que compararse.
+     *
+     * ⚠️ `failed` **no esta aca a proposito**: no es un escalon mas de la
+     * progresion sino un desenlace distinto que gana sobre los cuatro y no se
+     * sobrescribe. Decision del team lead del 2026-08-21, pendiente de que
+     * Diego la ratifique.
+     *
+     * @var array<string,int>
+     */
+    public const AVANCE_DE_ESTADOS = [
+        self::ESTADO_ENCOLADO => 0,
+        self::ESTADO_ENVIADO => 1,
+        self::ESTADO_ENTREGADO => 2,
+        self::ESTADO_LEIDO => 3,
+    ];
+
     protected $fillable = [
         'tenant_id',
         'booking_id',

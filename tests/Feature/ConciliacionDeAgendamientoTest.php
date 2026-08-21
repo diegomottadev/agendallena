@@ -7,6 +7,7 @@ use App\Jobs\ProcessMessageJob;
 use App\Models\Booking;
 use App\Models\Conversation;
 use App\Models\Integration;
+use App\Models\ReconciliationFinding;
 use App\Models\Tenant;
 use App\Support\TenantContext;
 use Carbon\CarbonImmutable;
@@ -73,24 +74,53 @@ use Tests\TestCase;
  * Google ignora `timeMin`/`timeMax` a propósito: el ticket no dice hasta dónde
  * mirar hacia atrás, y un test que lo fijara estaría inventándolo.
  *
- * ⚠️ **Cancelado y no ausente.** La decisión § 9 dice que el turno cuyo evento
- * desapareció se marca **cancelado**. `status` y `attendance` son columnas
+ * ## 🔄 § 9 se reescribió el 2026-08-21: **en duda, no cancelado**
+ *
+ * **Expectativa vieja, no regresión.** Hasta hoy la dirección inversa
+ * **cancelaba** el turno, y buena parte de este archivo lo afirmaba. Diego lo
+ * cambió, y el motivo es del negocio y no técnico: cancelar en silencio deja al
+ * cliente sin enterarse — tiene la confirmación en el celular y llega a la
+ * puerta. Avisarle automáticamente choca con la ventana de 24 h de Meta, que
+ * exigiría una plantilla aprobada que no existe.
+ *
+ * Lo que la corrida hace ahora con ese turno:
+ *
+ * - **No lo toca.** `status` queda como estaba y `attendance` también.
+ * - **Deja un hallazgo pendiente** en `reconciliation_findings`, que es lo que
+ *   el panel lista para que una persona lo resuelva —mantener o cancelar—.
+ * - Si hay que hablar con el cliente, lo hace una persona desde el número de
+ *   atención humana (`business_settings.human_phone`), que es un WhatsApp común
+ *   y no la Cloud API: sin plantilla, sin ventana de 24 h y sin costo por envío.
+ *   **El cliente no recibe nada automático**, y por eso acá no hay ni un test
+ *   que lo pida.
+ *
+ * Este archivo cubre la **detección**: qué turnos generan hallazgo y cuáles no.
+ * La tabla, el candado anti-duplicados y la pantalla donde se resuelven viven en
+ * `TurnosEnDudaTest`.
+ *
+ * ⚠️ **`attendance` sigue sin tocarse, y ahora `status` tampoco.** Son columnas
  * ortogonales a propósito (T-036): un turno puede estar `confirmed` y `no_show`
  * a la vez. Un turno que el dueño borró de su calendario **no es un cliente que
  * no vino**: nadie lo esperó. Si la conciliación tocara `attendance`, la tasa de
  * ausentismo —el número con el que se vende— contaría como plantones decisiones
- * administrativas del propio dueño. Por eso hay un test que afirma que
- * `attendance` queda intacta, y no es redundante con el que afirma el `status`.
+ * administrativas del propio dueño.
  *
  * ⚠️ **El nombre del código del reporte inverso lo elijo yo**:
  * `CONCILIACION_TURNO_SIN_EVENTO`, distinto del huérfano, porque son dos
- * situaciones distintas y quien lea el log tiene que poder separarlas.
+ * situaciones distintas y quien lea el log tiene que poder separarlas. **La
+ * línea de log sobrevive al cambio**: sigue siendo el rastro de que la corrida
+ * detectó el desalineado, ahora acompañada de la fila persistida.
  *
- * ⚠️ **Solo se cancelan turnos cuyo inicio todavía no pasó.** Decisión del
+ * ⚠️ **Los huérfanos siguen igual**: se reportan al log y **no** se persisten
+ * como hallazgo. Lo pidió así el encargo, textual. Queda anotada la tensión con
+ * la decisión § 8 en `test_reporta_el_evento_huerfano_que_ninguna_fila_reclama`.
+ *
+ * ⚠️ **Solo entran en duda los turnos cuyo inicio todavía no pasó.** Decisión del
  * team-lead del 2026-08-21, **pendiente de que Diego la ratifique**: § 9 no la
  * dice. Los dos daños que § 9 nombra —ocupar la agenda y contar para el
- * ausentismo— no aplican hacia atrás, y cancelar un turno pasado ya marcado lo
- * saca de la métrica en silencio. Ver los dos tests del final de la sección § 9.
+ * ausentismo— no aplican hacia atrás, y llenar la pantalla de turnos viejos que
+ * el dueño ya limpió es la vía más rápida a que deje de mirarla. Ver los dos
+ * tests del final de la sección § 9.
  */
 class ConciliacionDeAgendamientoTest extends TestCase
 {
@@ -326,6 +356,49 @@ class ConciliacionDeAgendamientoTest extends TestCase
             ->where('tenant_id', $tenant->id)
             ->where('external_event_id', $eventId)
             ->first();
+    }
+
+    /**
+     * § 9 · El hallazgo que dejó la conciliación sobre ese turno, o `null`.
+     *
+     * Se lee crudo con `DB::table()` por lo mismo que `filaCruda()`: un Global
+     * Scope podría esconder justo la fila que el test quiere ver, y entonces una
+     * fuga entre tenants se leería como "no pasó nada".
+     *
+     * Se busca por `booking_id` y no por el evento **a propósito**: es el dato
+     * que el hallazgo tiene que llevar sí o sí —«qué turno»— y no obliga al
+     * implementador a copiar además el `external_event_id`, que sería fijar más
+     * esquema del que el encargo pide.
+     */
+    private function hallazgoDelTurno(Tenant $tenant, string $eventId): ?object
+    {
+        $turno = $this->filaCruda($tenant, $eventId);
+
+        if ($turno === null) {
+            return null;
+        }
+
+        return DB::table('reconciliation_findings')
+            ->where('tenant_id', $tenant->id)
+            ->where('booking_id', $turno->id)
+            ->first();
+    }
+
+    /**
+     * ¿La corrida dejó ese turno en duda?
+     *
+     * Es el reemplazo de la vieja pregunta *«¿quedó cancelado?»*, y es el
+     * predicado con el que están escritos todos los canarios de este archivo.
+     */
+    private function quedoEnDuda(Tenant $tenant, string $eventId): bool
+    {
+        return $this->hallazgoDelTurno($tenant, $eventId) !== null;
+    }
+
+    /** Cuántos hallazgos hay en toda la base, sin filtrar por tenant. */
+    private function totalDeHallazgos(): int
+    {
+        return DB::table('reconciliation_findings')->count();
     }
 
     // ------------------------------------------------------------- el doble
@@ -570,6 +643,16 @@ class ConciliacionDeAgendamientoTest extends TestCase
      * Es el estado que deja el worker que murió entre el `POST` y el `INSERT`:
      * nadie compensó, y el horario está bloqueado en el calendario de la PyME
      * por un turno que el sistema no conoce.
+     *
+     * ⚠️ **El huérfano sigue siendo solo una línea de log, y eso lo decidió el
+     * encargo del 2026-08-21**: *"los huérfanos —eventos en Google sin fila—
+     * siguen igual"*. Queda en tensión con la decisión § 8 —mostrar los
+     * desalineados en el panel—, porque el código del log se llama literalmente
+     * `CONCILIACION_DESALINEADO` y esta es la mitad de § 8 que **no** queda
+     * cubierta: la pantalla de `TurnosEnDudaTest` lista turnos en duda, no
+     * huérfanos. Además el huérfano no tiene turno que mantener ni cancelar, así
+     * que las dos acciones de la pantalla no le aplican. **Es una decisión que
+     * hay que tomar, no la tomo yo.**
      */
     public function test_reporta_el_evento_huerfano_que_ninguna_fila_reclama(): void
     {
@@ -710,24 +793,32 @@ class ConciliacionDeAgendamientoTest extends TestCase
     }
 
     /**
-     * § 9 · RNF-03 · **Google caído no cancela turnos.**
+     * § 9 · RNF-03 · **Google caído no deja turnos en duda.**
      *
      * Es el modo de falla más caro que puede tener la dirección inversa, y el más
      * fácil de escribir sin darse cuenta: «no pude verificar» **no es** «el evento
      * no está». Si la conciliación tratara las dos cosas igual, media hora de
-     * Google devolviendo 500 le cancelaría a la PyME todos los turnos de los
-     * próximos dos meses, en dos corridas, sin que nadie toque nada. Y los
-     * clientes ya tienen su confirmación en el celular.
+     * Google devolviendo 500 le llenaría la pantalla a la PyME con todos los
+     * turnos de los próximos dos meses, en dos corridas, sin que nadie toque
+     * nada. Y una pantalla con la agenda entera pidiendo revisión es una pantalla
+     * que el dueño deja de mirar — que es exactamente la falla que la decisión
+     * del 2026-08-21 existe para evitar.
      *
      * ⚠️ La asimetría no es teórica: `eventoSigueExistiendo()` está documentado
      * para devolver `false` ante cualquier respuesta que no se pueda interpretar,
-     * porque para **no mandar un recordatorio** equivocarse es barato. Para
-     * **cancelar** no lo es. Este test fija esa diferencia.
+     * porque para **no mandar un recordatorio** equivocarse es barato. Para poner
+     * un turno en duda no lo es. Este test fija esa diferencia.
      *
      * El canario es Norte, cuyo calendario sí responde: sin él, este test lo pasa
      * un comando que no hace nada.
+     *
+     * ## Expectativa vieja, no regresión
+     *
+     * Antes afirmaba *«el turno de Sur no quedó `cancelled` y el de Norte sí»*.
+     * Ahora afirma *«el turno de Sur no generó hallazgo y el de Norte sí»*: § 9
+     * dejó de cancelar y pasó a dejar el turno en duda.
      */
-    public function test_un_fallo_de_google_no_cancela_los_turnos_de_esa_pyme(): void
+    public function test_un_fallo_de_google_no_deja_en_duda_los_turnos_de_esa_pyme(): void
     {
         $this->fakeDeGoogle(tokenCaido: $this->tokenDe(self::PHONE_NUMBER_ID));
 
@@ -742,28 +833,30 @@ class ConciliacionDeAgendamientoTest extends TestCase
 
         $this->conciliar();
 
-        $this->assertSame(Booking::ESTADO_CANCELADO,
-            $this->filaCruda($otro, 'evt_de_norte')?->status,
-            'Canario: la corrida no canceló el turno de la PyME cuyo calendario sí respondía, '
-            .'así que lo que este test afirma sobre el fallo no distingue nada.');
+        $this->assertTrue($this->quedoEnDuda($otro, 'evt_de_norte'),
+            'Canario: el turno futuro de la PyME cuyo calendario sí respondía no generó '
+            .'hallazgo, así que lo que este test afirma sobre el fallo no distingue nada.');
+
+        $this->assertFalse($this->quedoEnDuda($this->tenant, 'evt_de_sur'),
+            'Un 500 de Google puso en duda un turno real: la conciliación confundió «no pude '
+            .'verificar» con «el evento no está» (RNF-03).');
 
         $this->assertSame(Booking::ESTADO_AGENDADO,
             $this->filaCruda($this->tenant, 'evt_de_sur')?->status,
-            'Un 500 de Google canceló un turno real: la conciliación confundió «no pude '
-            .'verificar» con «el evento no está» (RNF-03).');
+            'Un 500 de Google le movió el estado a un turno real.');
 
         $this->assertSame(['evt_de_norte'], $this->turnosSinEventoReportados(),
             'Se reportó como turno sin evento uno cuyo calendario ni siquiera se pudo leer.');
     }
 
     /**
-     * § 9 · Un turno **más lejos de lo que la conciliación mira** no se cancela.
+     * § 9 · Un turno **más lejos de lo que la conciliación mira** no queda en duda.
      *
      * Es la misma confusión que el 500 de Google, con otro disfraz: la ventana es
      * `−2/+60 días` (`ConciliarAgendamientos::DIAS_HACIA_*`), y de un turno a 80
      * días la corrida **no tiene ninguna información** — no lo pidió. Si la
      * consulta a `bookings` no respetara la misma ventana que el listado a
-     * Google, cada corrida cancelaría todos los turnos lejanos por no verlos: los
+     * Google, cada corrida pondría en duda todos los turnos lejanos por no verlos: los
      * que la PyME agenda con más anticipación, que son los que más le importan.
      *
      * El doble ignora `timeMin`/`timeMax` a propósito, así que este test no puede
@@ -772,8 +865,13 @@ class ConciliacionDeAgendamientoTest extends TestCase
      *
      * ⚠️ Que el turno lejano quede intacto es criterio mío, coherente con el test
      * del 500: no haber mirado no es haber verificado que no está.
+     *
+     * ## Expectativa vieja, no regresión
+     *
+     * Antes afirmaba *«el turno lejano no quedó `cancelled` y el cercano sí»*.
+     * Ahora afirma *«el lejano no generó hallazgo y el cercano sí»*.
      */
-    public function test_no_cancela_un_turno_que_cae_fuera_de_la_ventana_que_mira(): void
+    public function test_no_deja_en_duda_un_turno_que_cae_fuera_de_la_ventana_que_mira(): void
     {
         $this->fakeDeGoogle();
 
@@ -786,22 +884,24 @@ class ConciliacionDeAgendamientoTest extends TestCase
 
         $this->conciliar();
 
-        $this->assertSame(Booking::ESTADO_CANCELADO,
-            $this->filaCruda($this->tenant, 'evt_cercano')?->status,
-            'Canario: la corrida no canceló el turno que sí estaba dentro de la ventana, así '
-            .'que lo que este test afirma sobre el turno lejano no distingue nada.');
+        $this->assertTrue($this->quedoEnDuda($this->tenant, 'evt_cercano'),
+            'Canario: el turno futuro que sí estaba dentro de la ventana no generó hallazgo, '
+            .'así que lo que este test afirma sobre el turno lejano no distingue nada.');
+
+        $this->assertFalse($this->quedoEnDuda($this->tenant, 'evt_lejano'),
+            'Se puso en duda un turno que la conciliación ni siquiera consultó: la ventana del '
+            .'listado a Google y la de la consulta a bookings no son la misma.');
 
         $this->assertSame(Booking::ESTADO_AGENDADO,
             $this->filaCruda($this->tenant, 'evt_lejano')?->status,
-            'Se canceló un turno que la conciliación ni siquiera consultó: la ventana del '
-            .'listado a Google y la de la consulta a bookings no son la misma.');
+            'Se le movió el estado a un turno que la conciliación ni siquiera consultó.');
 
         $this->assertSame(['evt_cercano'], $this->turnosSinEventoReportados(),
             'Se reportó como turno sin evento uno que cae fuera de la ventana revisada.');
     }
 
     /**
-     * § 9 · Un turno **que ya ocurrió** no se cancela nunca por conciliación.
+     * § 9 · Un turno **que ya ocurrió** no queda nunca en duda por conciliación.
      *
      * ⚠️ **Decisión del team-lead que Diego tiene que ratificar.** § 9 no lo dice:
      * habla de turnos vivos sin distinguir si ya pasaron. Va marcada, no
@@ -809,20 +909,26 @@ class ConciliacionDeAgendamientoTest extends TestCase
      *
      * El fundamento son los dos daños que § 9 nombra, y ninguno aplica hacia
      * atrás. **«Ocupa la agenda»**: un horario que ya transcurrió no ocupa nada.
-     * **«Cuenta para la tasa de ausentismo»**: acá es peor que inútil, es
-     * destructivo — la tasa se calcula solo sobre los turnos marcados (§ 1) y un
-     * turno cancelado no cuenta como ausente, así que cancelar hacia atrás
-     * **saca turnos de la métrica en silencio**.
+     * **«Cuenta para la tasa de ausentismo»**: el turno pasado ya se marca en la
+     * pantalla de asistencia de T-038, que es donde vive ese dato.
      *
      * Y el gesto no significa lo mismo en cada dirección: borrar un evento viejo
      * del calendario es higiene, la hace cualquiera. Borrar uno futuro es una
-     * decisión sobre un turno. Solo la segunda es una señal que valga interpretar.
+     * decisión sobre un turno. Solo la segunda es una señal que valga interpretar,
+     * y ahora que el resultado es **una fila en una pantalla que una persona
+     * atiende**, el costo de equivocarse cambió de forma: ya no es cancelar de
+     * más, es llenar la lista de higiene del dueño hasta que deje de mirarla.
      *
      * El turno pasado está **dentro** de la ventana `−2/+60` a propósito: si
      * cayera afuera, este test lo pasaría el mismo código que respeta la ventana
      * y no probaría nada nuevo.
+     *
+     * ## Expectativa vieja, no regresión
+     *
+     * Antes afirmaba *«el turno de ayer no quedó `cancelled` y el de mañana sí»*.
+     * Ahora afirma *«el de ayer no generó hallazgo y el de mañana sí»*.
      */
-    public function test_no_cancela_un_turno_que_ya_ocurrio(): void
+    public function test_no_deja_en_duda_un_turno_que_ya_ocurrio(): void
     {
         $this->fakeDeGoogle();
 
@@ -835,15 +941,17 @@ class ConciliacionDeAgendamientoTest extends TestCase
 
         $this->conciliar();
 
-        $this->assertSame(Booking::ESTADO_CANCELADO,
-            $this->filaCruda($this->tenant, 'evt_de_maniana')?->status,
-            'Canario: la corrida no canceló el turno futuro que perdió su evento, así que lo '
-            .'que este test afirma sobre el turno pasado no distingue nada.');
+        $this->assertTrue($this->quedoEnDuda($this->tenant, 'evt_de_maniana'),
+            'Canario: el turno futuro que perdió su evento no generó hallazgo, así que lo que '
+            .'este test afirma sobre el turno pasado no distingue nada.');
+
+        $this->assertFalse($this->quedoEnDuda($this->tenant, 'evt_de_ayer'),
+            'Se puso en duda un turno que ya ocurrió: el dueño limpió su calendario viejo '
+            .'—higiene normal— y la pantalla se le llenó de turnos que no hay que resolver.');
 
         $this->assertSame(Booking::ESTADO_AGENDADO,
             $this->filaCruda($this->tenant, 'evt_de_ayer')?->status,
-            'Se canceló un turno que ya ocurrió: el dueño limpió su calendario viejo —higiene '
-            .'normal— y con eso borró un turno de la métrica de ausentismo sin que nadie lo pida.');
+            'Se le movió el estado a un turno que ya ocurrió.');
 
         $this->assertSame(['evt_de_maniana'], $this->turnosSinEventoReportados(),
             'Se reportó como turno sin evento uno que ya ocurrió: el reporte se llena de '
@@ -855,13 +963,15 @@ class ConciliacionDeAgendamientoTest extends TestCase
      *
      * Es el caso que de verdad duele, y por eso va aparte del anterior. Alguien
      * registró que ese cliente vino: es un dato real, tomado por una persona, con
-     * su auditoría de quién lo marcó y cuándo (T-036). Si la conciliación
-     * cancelara el turno, ese `attended` deja de contar para la tasa —la métrica
-     * mira los turnos marcados y el cancelado no es uno— y el número con el que
-     * se vende el producto empeora solo, sin que nadie haya hecho nada mal.
+     * su auditoría de quién lo marcó y cuándo (T-036). Si ese turno apareciera en
+     * la pantalla de turnos en duda, alguien podría cancelarlo desde ahí, y ese
+     * `attended` dejaría de contar para la tasa —la métrica mira los turnos
+     * marcados y el cancelado no es uno—: el número con el que se vende el
+     * producto empeoraría solo, sin que nadie haya hecho nada mal.
      *
-     * Se afirman las dos columnas: que el turno no se canceló **y** que la
-     * asistencia sigue ahí. Son ortogonales (T-036) y se rompen por separado.
+     * Se afirman las tres cosas: que no generó hallazgo, que el estado no se
+     * movió **y** que la asistencia sigue ahí. `status` y `attendance` son
+     * ortogonales (T-036) y se rompen por separado.
      */
     public function test_un_turno_pasado_con_asistencia_marcada_conserva_su_asistencia(): void
     {
@@ -876,10 +986,13 @@ class ConciliacionDeAgendamientoTest extends TestCase
 
         $this->conciliar();
 
-        $this->assertSame(Booking::ESTADO_CANCELADO,
-            $this->filaCruda($this->tenant, 'evt_de_maniana')?->status,
-            'Canario: la corrida no canceló el turno futuro que perdió su evento, así que lo '
-            .'que este test afirma sobre el turno atendido no distingue nada.');
+        $this->assertTrue($this->quedoEnDuda($this->tenant, 'evt_de_maniana'),
+            'Canario: el turno futuro que perdió su evento no generó hallazgo, así que lo que '
+            .'este test afirma sobre el turno atendido no distingue nada.');
+
+        $this->assertFalse($this->quedoEnDuda($this->tenant, 'evt_atendido'),
+            'Un turno al que el cliente ya vino apareció pidiendo revisión: si alguien lo '
+            .'cancela desde la pantalla, esa asistencia sale de la tasa de ausentismo.');
 
         $fila = $this->filaCruda($this->tenant, 'evt_atendido');
 
@@ -888,21 +1001,23 @@ class ConciliacionDeAgendamientoTest extends TestCase
             .'la marcó y cuándo, justamente porque es un dato que nadie más puede reconstruir.');
 
         $this->assertSame(Booking::ESTADO_AGENDADO, $fila?->status,
-            'Se canceló un turno al que el cliente efectivamente vino: sale de la tasa de '
-            .'ausentismo y el número empeora solo, sin que nadie haya hecho nada mal.');
+            'Se le movió el estado a un turno al que el cliente efectivamente vino.');
     }
 
-    // ----------------------------- § 9 · el listado incompleto no autoriza a cancelar
+    // ------------------------- § 9 · el listado incompleto no autoriza a poner en duda
 
     /**
-     * § 9 · Con el listado **truncado**, el barrido inverso no cancela nada de
-     * esa PyME.
+     * § 9 · Con el listado **truncado**, el barrido inverso no pone en duda nada
+     * de esa PyME.
      *
      * Para el barrido de huérfanos un listado incompleto cuesta un reporte
-     * perdido. Para el inverso cuesta turnos reales: el set se arma con lo que
-     * vino, y todo turno que no esté ahí se cancela. La PyME afectada pierde
-     * turnos vivos **con la confirmación ya en el celular del cliente**, y cada
-     * corrida de 15 minutos lo vuelve a hacer.
+     * perdido. Para el inverso cuesta la pantalla entera: el set se arma con lo
+     * que vino, y todo turno que no esté ahí queda pidiendo revisión. La PyME
+     * afectada abre el panel y encuentra su agenda completa marcada como
+     * dudosa **con la confirmación ya en el celular de cada cliente** — y el
+     * candado de la tabla hace que eso sea peor, no mejor: los hallazgos son uno
+     * por turno y para siempre, así que una sola corrida truncada deja una lista
+     * de basura que nadie va a poder distinguir de la real.
      *
      * Es la tercera cara de lo mismo que ya fijaron el test del 500 y el de la
      * ventana: **no haber mirado no es haber verificado que no está.**
@@ -916,13 +1031,20 @@ class ConciliacionDeAgendamientoTest extends TestCase
      * El caso que hay que montar para que este test siga probando lo mismo es el
      * **patológico**: un calendario que no se termina de leer ni agotando el
      * tope de páginas. **El comportamiento afirmado no cambió** —listado
-     * incompleto, no se cancela— cambió qué situación lo produce.
+     * incompleto, el barrido inverso no corre— cambió qué situación lo produce.
      *
      * El canario es temporal y no cruzado: el doble es patológico **solo en el
      * primer listado**, así que la segunda corrida —idéntica en todo lo demás—
-     * sí tiene que cancelar. Sin eso, «no cancela» lo pasa cualquier cosa.
+     * sí tiene que dejar el hallazgo. Sin eso, «no genera hallazgo» lo pasa
+     * cualquier cosa.
+     *
+     * ## Expectativa vieja, no regresión
+     *
+     * Antes afirmaba *«el turno no quedó `cancelled`, y en la corrida siguiente
+     * sí»*. Ahora afirma *«el turno no generó hallazgo, y en la corrida
+     * siguiente sí»*.
      */
-    public function test_con_el_listado_truncado_no_cancela_los_turnos_de_esa_pyme(): void
+    public function test_con_el_listado_truncado_no_deja_en_duda_los_turnos_de_esa_pyme(): void
     {
         $this->fakeDeGoogle(
             tokenPatologico: $this->tokenDe(self::PHONE_NUMBER_ID),
@@ -935,21 +1057,24 @@ class ConciliacionDeAgendamientoTest extends TestCase
 
         $this->conciliar();
 
+        $this->assertFalse($this->quedoEnDuda($this->tenant, 'evt_en_la_pagina_dos'),
+            'Se puso en duda un turno vivo porque su evento estaba en una página del calendario '
+            .'que la conciliación nunca leyó: el cliente ya tiene la confirmación en el celular '
+            .'y el hallazgo, por el candado, no se puede volver a generar bien nunca más.');
+
         $this->assertSame(Booking::ESTADO_AGENDADO,
             $this->filaCruda($this->tenant, 'evt_en_la_pagina_dos')?->status,
-            'Se canceló un turno vivo porque su evento estaba en una página del calendario que '
-            .'la conciliación nunca leyó: el cliente ya tiene la confirmación en el celular.');
+            'Se le movió el estado a un turno cuyo calendario se leyó a medias.');
 
         $this->assertSame([], $this->turnosSinEventoReportados(),
             'Se reportó como turno sin evento uno cuyo calendario se leyó a medias.');
 
-        // Canario: la misma corrida, ya sin truncar, sí lo cancela.
+        // Canario: la misma corrida, ya sin truncar, sí lo deja en duda.
         $this->conciliar();
 
-        $this->assertSame(Booking::ESTADO_CANCELADO,
-            $this->filaCruda($this->tenant, 'evt_en_la_pagina_dos')?->status,
-            'Canario: con el listado completo tampoco se canceló, así que lo que este test '
-            .'afirma sobre el listado truncado no distingue nada.');
+        $this->assertTrue($this->quedoEnDuda($this->tenant, 'evt_en_la_pagina_dos'),
+            'Canario: con el listado completo tampoco se generó hallazgo, así que lo que este '
+            .'test afirma sobre el listado truncado no distingue nada.');
     }
 
     /**
@@ -1007,6 +1132,11 @@ class ConciliacionDeAgendamientoTest extends TestCase
      * cambió.** Y con la paginación el test dice algo más caro que antes: la
      * PyME patológica ya no gasta una llamada a Google sino todas las del tope,
      * y aun así la siguiente tiene que quedar barrida.
+     *
+     * ## Expectativa vieja, no regresión
+     *
+     * Antes afirmaba *«Norte quedó `cancelled` y Sur no»*. Ahora afirma *«Norte
+     * generó hallazgo y Sur no»*.
      */
     public function test_el_listado_truncado_de_una_pyme_no_frena_a_las_demas(): void
     {
@@ -1019,42 +1149,62 @@ class ConciliacionDeAgendamientoTest extends TestCase
 
         $this->conciliar();
 
-        $this->assertSame(Booking::ESTADO_CANCELADO,
-            $this->filaCruda($otro, 'evt_de_norte')?->status,
-            'La PyME con el listado truncado dejó sin barrer a la siguiente: el freno tiene que '
-            .'ser de ese tenant, no de la corrida.');
+        $this->assertTrue($this->quedoEnDuda($otro, 'evt_de_norte'),
+            'Canario: la PyME con el listado truncado dejó sin barrer a la siguiente, así que '
+            .'el freno es de la corrida y no de ese tenant.');
+
+        $this->assertFalse($this->quedoEnDuda($this->tenant, 'evt_de_sur'),
+            'Se puso en duda el turno de la PyME cuyo calendario se leyó a medias.');
 
         $this->assertSame(Booking::ESTADO_AGENDADO,
             $this->filaCruda($this->tenant, 'evt_de_sur')?->status,
-            'Se canceló el turno de la PyME cuyo calendario se leyó a medias.');
+            'Se le movió el estado al turno de la PyME cuyo calendario se leyó a medias.');
 
         $this->assertSame(['evt_de_norte'], $this->turnosSinEventoReportados());
     }
 
-    // ------------------------ § 9 · un UPDATE que falla no se lleva puesta la corrida
+    // -------------------- § 9 · un hallazgo que no se guarda no se lleva puesta la corrida
 
     /**
-     * § 9 · Si el `UPDATE` de un turno falla, **las demás PyMEs se concilian
+     * § 9 · Si guardar **un** hallazgo falla, **las demás PyMEs se concilian
      * igual**.
      *
-     * `cancelarTurnosSinEvento()` hace `$turno->save()` sin `catch`. Un deadlock,
-     * una base que se cae un segundo, y la excepción sube hasta `handle()` y
-     * **aborta la corrida entera**: las PyMEs que faltaban no se concilian, la
-     * línea final nunca se imprime y nadie se entera de que la conciliación no
-     * terminó. El patrón contrario ya existe tres líneas más arriba, para el
-     * listado que no se pudo leer.
+     * Un deadlock, una base que se cae un segundo, y sin `catch` la excepción
+     * sube hasta `handle()` y **aborta la corrida entera**: las PyMEs que
+     * faltaban no se concilian, la línea final nunca se imprime y nadie se entera
+     * de que la conciliación no terminó. El patrón contrario ya existe unas
+     * líneas más arriba, para el listado que no se pudo leer.
      *
-     * El fallo se simula con un `updating` de Eloquent que lanza, que es
+     * Que el turno quede **sin hallazgo** es el lado seguro del error: la corrida
+     * de dentro de quince minutos lo vuelve a intentar y el candado de la tabla
+     * no se gastó.
+     *
+     * El fallo se simula con un `creating` de Eloquent que lanza, que es
      * exactamente lo que hace un `save()` que no puede escribir. Sur se procesa
      * primero —se le atrasa el `created_at`, porque el reloj está congelado y dos
      * tenants creados en el mismo instante no tienen orden garantizado— y Norte
      * es el canario que prueba que la corrida siguió.
      *
+     * ⚠️ **Esto obliga a que el hallazgo se escriba por el modelo**, no con un
+     * `DB::table()->insert()` suelto ni con un `insert()` masivo. Es la misma
+     * restricción que este test ya imponía sobre el `save()` del turno, y la
+     * afirmación de abajo la protege: si el implementador pasa a un camino que no
+     * dispara eventos de modelo, el test se pone **rojo** en vez de quedar verde
+     * sin probar nada.
+     *
      * ⚠️ Este test **no afirma** que el fallo se registre ni cuál sería su código:
      * el encargo pide que no frene a las demás, y el registro sería una decisión
      * más que nadie tomó. Vale la pena decidirla aparte.
+     *
+     * ## Expectativa vieja, no regresión
+     *
+     * Antes el fallo se montaba sobre `Booking::updating` —el `UPDATE` que
+     * cancelaba el turno— y afirmaba que Norte quedaba `cancelled`. Ahora la
+     * conciliación **no escribe en `bookings`**, así que no hay `UPDATE` que
+     * romper: el fallo se monta sobre el `INSERT` del hallazgo, y lo afirmado
+     * pasa a ser *«Norte generó hallazgo igual»*.
      */
-    public function test_un_update_que_falla_no_deja_sin_conciliar_a_las_demas_pymes(): void
+    public function test_un_hallazgo_que_no_se_puede_guardar_no_deja_sin_conciliar_a_las_demas_pymes(): void
     {
         $this->fakeDeGoogle();
 
@@ -1065,28 +1215,26 @@ class ConciliacionDeAgendamientoTest extends TestCase
         DB::table('tenants')->where('id', $this->tenant->id)
             ->update(['created_at' => CarbonImmutable::now('UTC')->subDay()]);
 
-        $this->turnoEnLaBase($this->tenant, 'evt_que_no_se_puede_guardar');
+        $delQueFalla = $this->turnoEnLaBase($this->tenant, 'evt_que_no_se_puede_guardar');
         $this->turnoEnLaBase($otro, 'evt_de_norte', 'Ana');
 
-        Booking::updating(function (Booking $turno) {
-            if ($turno->external_event_id === 'evt_que_no_se_puede_guardar') {
+        ReconciliationFinding::creating(function (ReconciliationFinding $hallazgo) use ($delQueFalla) {
+            if ((string) $hallazgo->booking_id === (string) $delQueFalla->id) {
                 throw new \RuntimeException('Deadlock found when trying to get lock');
             }
         });
 
         $this->conciliar();
 
-        $this->assertSame(Booking::ESTADO_CANCELADO,
-            $this->filaCruda($otro, 'evt_de_norte')?->status,
-            'Un UPDATE que falló en la primera PyME abortó la corrida: las demás quedaron sin '
+        $this->assertTrue($this->quedoEnDuda($otro, 'evt_de_norte'),
+            'Un INSERT que falló en la primera PyME abortó la corrida: las demás quedaron sin '
             .'conciliar y ni siquiera se imprimió el resumen, así que nadie se entera.');
 
-        // Que el turno de Sur siga vivo prueba que el fallo simulado ocurrió de
-        // verdad. Si un día el barrido pasara a un `update()` masivo —que no
-        // dispara eventos de modelo—, esta afirmación se pone roja en vez de
-        // dejar el test verde sin probar nada.
-        $this->assertSame(Booking::ESTADO_AGENDADO,
-            $this->filaCruda($this->tenant, 'evt_que_no_se_puede_guardar')?->status,
+        // Que el turno de Sur haya quedado sin hallazgo prueba que el fallo
+        // simulado ocurrió de verdad. Si un día el barrido pasara a un `insert()`
+        // masivo —que no dispara eventos de modelo—, esta afirmación se pone roja
+        // en vez de dejar el test verde sin probar nada.
+        $this->assertFalse($this->quedoEnDuda($this->tenant, 'evt_que_no_se_puede_guardar'),
             'El fallo simulado no ocurrió: este test no está probando lo que dice.');
     }
 
@@ -1210,29 +1358,67 @@ class ConciliacionDeAgendamientoTest extends TestCase
      * agenda —ningún otro cliente puede reservar ese hueco— y **entra en el
      * cálculo de la tasa de ausentismo**, que es el número con el que se vende el
      * producto. La misma corrida que caza huérfanos tiene que cazar esto.
+     *
+     * **Y tiene que cazarlo sin decidir por nadie.** Cancelarlo en el acto deja
+     * al cliente sin enterarse: tiene la confirmación en el celular y llega a la
+     * puerta. Por eso el turno queda **en duda** —una fila pendiente que el panel
+     * lista— y lo resuelve una persona, que si hace falta lo llama desde el
+     * número de atención humana.
+     *
+     * ## Expectativa vieja, no regresión
+     *
+     * Antes afirmaba *«el turno quedó `cancelled`»*. Ahora afirma *«el turno
+     * sigue como estaba y quedó un hallazgo pendiente»*.
      */
-    public function test_cancela_el_turno_vivo_cuyo_evento_ya_no_esta_en_el_calendario(): void
+    public function test_deja_en_duda_el_turno_vivo_cuyo_evento_ya_no_esta_en_el_calendario(): void
     {
         $this->fakeDeGoogle();
 
         // La fila existe; el calendario del tenant está vacío: el dueño lo borró.
-        $this->turnoEnLaBase($this->tenant, 'evt_borrado_a_mano');
+        $turno = $this->turnoEnLaBase($this->tenant, 'evt_borrado_a_mano');
 
         $this->conciliar();
 
-        $fila = $this->filaCruda($this->tenant, 'evt_borrado_a_mano');
+        $hallazgo = $this->hallazgoDelTurno($this->tenant, 'evt_borrado_a_mano');
 
-        $this->assertSame(Booking::ESTADO_CANCELADO, $fila?->status,
-            'El turno cuyo evento el dueño borró sigue vivo en la base: bloquea un horario '
-            .'que en el calendario ya está libre y ensucia la tasa de ausentismo.');
+        $this->assertNotNull($hallazgo,
+            'El turno cuyo evento el dueño borró no quedó en duda: sigue bloqueando un horario '
+            .'que en el calendario ya está libre, ensucia la tasa de ausentismo y nadie en el '
+            .'negocio se entera de que hay algo que resolver.');
+
+        // `tenant_id` es UUID: se compara como string. Un `(int)` sobre un UUID
+        // devuelve `1` para todos y esta afirmación pasaría siempre.
+        $this->assertSame($this->tenant->id, (string) $hallazgo->tenant_id,
+            'El hallazgo no dice de qué PyME es: sin eso el panel no lo puede filtrar (RNF-01).');
+
+        $this->assertSame((string) $turno->id, (string) $hallazgo->booking_id,
+            'El hallazgo no dice qué turno está en duda: sin eso nadie lo puede resolver.');
+
+        $this->assertSame(ReconciliationFinding::TIPO_TURNO_SIN_EVENTO, $hallazgo->type,
+            'El hallazgo no dice de qué tipo es: mezclado con los demás, la pantalla no puede '
+            .'ofrecer las acciones que corresponden a este caso.');
+
+        $this->assertNotNull($hallazgo->detected_at,
+            'El hallazgo no dice cuándo se detectó: es el dato que ordena la pantalla y el que '
+            .'permite ver hace cuánto que algo está sin resolver.');
+
+        $this->assertNull($hallazgo->resolved_at,
+            'El hallazgo nace resuelto: entonces no aparece en la pantalla y el desalineado '
+            .'queda invisible, que es exactamente lo que esta tabla existe para evitar.');
+
+        $this->assertSame(Booking::ESTADO_AGENDADO,
+            $this->filaCruda($this->tenant, 'evt_borrado_a_mano')?->status,
+            'La conciliación canceló el turno por su cuenta: el cliente tiene la confirmación '
+            .'en el celular, no recibe ningún aviso —Meta exige plantilla fuera de las 24 h— y '
+            .'llega igual a la puerta.');
 
         $this->assertSame(['evt_borrado_a_mano'], $this->turnosSinEventoReportados(),
-            'La conciliación canceló el turno sin dejar registro: nadie puede auditar por qué '
-            .'un turno se cayó solo.');
+            'La conciliación dejó el turno en duda sin registrar la detección en el log: es el '
+            .'rastro con el que se audita qué vio la corrida.');
     }
 
     /**
-     * § 9 · Ese turno **no es un ausente**. `attendance` no se toca.
+     * § 9 · El turno en duda **no es un ausente**. `attendance` no se toca.
      *
      * `status` y `attendance` son ortogonales a propósito (T-036). Un cliente que
      * no vino y un turno que el dueño borró de su calendario son dos cosas
@@ -1241,12 +1427,16 @@ class ConciliacionDeAgendamientoTest extends TestCase
      * ausentismo, y esa tasa es literalmente el número con el que se le muestra
      * al cliente que el producto sirve.
      *
-     * ⚠️ La afirmación sobre el `status` **no es decoración**: sin ella este test
-     * pasa en vacío, porque un comando que no hace nada tampoco toca
-     * `attendance`. Es la precondición que le da sentido al resto — «el turno
-     * *cancelado por la conciliación*» tiene que estar efectivamente cancelado.
+     * ⚠️ La precondición **no es decoración**: sin ella este test pasa en vacío,
+     * porque un comando que no hace nada tampoco toca `attendance`. Que el turno
+     * haya quedado efectivamente en duda es lo que le da sentido al resto.
+     *
+     * ## Expectativa vieja, no regresión
+     *
+     * La precondición pasó de *«el turno quedó `cancelled`»* a *«el turno generó
+     * hallazgo»*. **Lo afirmado no cambió**: `attendance` sigue intacta.
      */
-    public function test_el_turno_cancelado_por_la_conciliacion_no_queda_marcado_como_ausente(): void
+    public function test_el_turno_en_duda_no_queda_marcado_como_ausente(): void
     {
         $this->fakeDeGoogle();
 
@@ -1254,11 +1444,11 @@ class ConciliacionDeAgendamientoTest extends TestCase
 
         $this->conciliar();
 
-        $fila = $this->filaCruda($this->tenant, 'evt_borrado_a_mano');
+        $this->assertTrue($this->quedoEnDuda($this->tenant, 'evt_borrado_a_mano'),
+            'Precondición del test: el turno ni siquiera quedó en duda, así que lo que este '
+            .'test afirma sobre la asistencia no probaría nada.');
 
-        $this->assertSame(Booking::ESTADO_CANCELADO, $fila?->status,
-            'Precondición del test: el turno ni siquiera se canceló, así que lo que este test '
-            .'afirma sobre la asistencia no probaría nada.');
+        $fila = $this->filaCruda($this->tenant, 'evt_borrado_a_mano');
 
         $this->assertNotSame(Booking::ASISTENCIA_AUSENTE, $fila?->attendance,
             'La conciliación marcó como ausente a un cliente que nadie esperó: la tasa de '
@@ -1272,14 +1462,19 @@ class ConciliacionDeAgendamientoTest extends TestCase
     /**
      * § 9 · El turno cuyo evento **sí está** no se toca.
      *
-     * Sin este test, un comando que cancele todos los turnos en cada corrida
-     * pasaría los dos anteriores y borraría la agenda entera de la PyME cada
-     * quince minutos.
+     * Sin este test, un comando que ponga en duda todos los turnos en cada
+     * corrida pasaría los dos anteriores y le dejaría al dueño la agenda entera
+     * pidiendo revisión cada quince minutos.
      *
      * Los **dos** turnos conviven en la misma corrida a propósito: el que perdió
      * su evento es el canario. Sin él, este test lo pasa también un comando que
      * no hace absolutamente nada, y entonces no distingue «no toca lo sano» de
      * «no toca nada».
+     *
+     * ## Expectativa vieja, no regresión
+     *
+     * Antes afirmaba *«el turno sano no quedó `cancelled` y el otro sí»*. Ahora
+     * afirma *«el turno sano no generó hallazgo y el otro sí»*.
      */
     public function test_no_toca_el_turno_cuyo_evento_sigue_en_el_calendario(): void
     {
@@ -1293,36 +1488,45 @@ class ConciliacionDeAgendamientoTest extends TestCase
 
         $this->conciliar();
 
-        $this->assertSame(Booking::ESTADO_CANCELADO,
-            $this->filaCruda($this->tenant, 'evt_sin_evento')?->status,
-            'Canario: la corrida no canceló el turno que sí perdió su evento, así que lo que '
-            .'este test afirma sobre el turno sano no distingue nada.');
+        $this->assertTrue($this->quedoEnDuda($this->tenant, 'evt_sin_evento'),
+            'Canario: el turno que sí perdió su evento no generó hallazgo, así que lo que este '
+            .'test afirma sobre el turno sano no distingue nada.');
+
+        $this->assertFalse($this->quedoEnDuda($this->tenant, 'evt_vivo'),
+            'La conciliación puso en duda un turno que está bien en los dos lados: alguien lo '
+            .'va a resolver a mano y el cliente puede terminar con el turno cancelado.');
 
         $this->assertSame(Booking::ESTADO_AGENDADO,
             $this->filaCruda($this->tenant, 'evt_vivo')?->status,
-            'La conciliación canceló un turno que está bien en los dos lados: el cliente va a '
-            .'llegar a un turno que el sistema dio de baja sin avisarle a nadie.');
+            'La conciliación le movió el estado a un turno que está bien en los dos lados.');
 
         $this->assertSame(['evt_sin_evento'], $this->turnosSinEventoReportados(),
             'Reportó como turno sin evento uno cuyo evento está en el calendario.');
     }
 
     /**
-     * § 9 · RNF-01 · La conciliación de una PyME **no puede cancelar el turno de
-     * otra**.
+     * § 9 · RNF-01 · La conciliación de una PyME **no puede poner en duda el
+     * turno de otra**.
      *
      * Es el modo de falla más caro de los dos que tiene la dirección inversa: una
      * consulta a `bookings` sin filtrar por tenant encuentra el turno de
      * *Peluquería Sur*, pregunta por su evento **contra el calendario de
-     * Consultorio Norte** —donde obviamente no está—, y lo cancela. La PyME
-     * pierde turnos reales por culpa de una vecina que ni conoce.
+     * Consultorio Norte** —donde obviamente no está—, y lo marca. La PyME ve
+     * turnos sanos pidiendo revisión por culpa de una vecina que ni conoce, y el
+     * hallazgo cruzado además le muestra a Norte el nombre y el teléfono de una
+     * clienta de Sur, que es la fuga que RNF-01 existe para impedir.
      *
      * El turno de Sur está sano: su evento existe en su propio calendario. Norte
      * tiene un turno que sí perdió su evento —el canario, que obliga a que la
      * corrida haya hecho su trabajo de verdad—. Después de conciliar, el de Norte
-     * tiene que estar cancelado y el de Sur intacto.
+     * tiene que estar en duda y el de Sur intacto.
+     *
+     * ## Expectativa vieja, no regresión
+     *
+     * Antes afirmaba *«Norte quedó `cancelled` y Sur no»*. Ahora afirma *«Norte
+     * generó hallazgo, Sur no, y el hallazgo lleva el `tenant_id` de Norte»*.
      */
-    public function test_la_conciliacion_de_un_tenant_no_cancela_el_turno_de_otro(): void
+    public function test_la_conciliacion_de_un_tenant_no_deja_en_duda_el_turno_de_otro(): void
     {
         $this->fakeDeGoogle();
 
@@ -1336,41 +1540,70 @@ class ConciliacionDeAgendamientoTest extends TestCase
 
         $this->conciliar();
 
-        $this->assertSame(Booking::ESTADO_CANCELADO,
-            $this->filaCruda($otro, 'evt_de_norte')?->status,
-            'Canario: la corrida no canceló el turno de Norte que perdió su evento, así que lo '
+        $deNorte = $this->hallazgoDelTurno($otro, 'evt_de_norte');
+
+        $this->assertNotNull($deNorte,
+            'Canario: el turno de Norte que perdió su evento no generó hallazgo, así que lo '
             .'que este test afirma sobre el aislamiento no distingue nada.');
+
+        $this->assertFalse($this->quedoEnDuda($this->tenant, 'evt_de_sur'),
+            'La conciliación de otra PyME puso en duda un turno que no era suyo: buscó la fila '
+            .'sin filtrar por tenant y la cruzó contra el calendario equivocado (RNF-01).');
 
         $fila = $this->filaCruda($this->tenant, 'evt_de_sur');
 
         $this->assertSame(Booking::ESTADO_AGENDADO, $fila?->status,
-            'La conciliación de otra PyME canceló un turno que no era suyo: buscó la fila sin '
-            .'filtrar por tenant y preguntó por el evento en el calendario equivocado (RNF-01).');
+            'La conciliación de otra PyME le movió el estado a un turno que no era suyo.');
 
         $this->assertSame(['evt_de_norte'], $this->turnosSinEventoReportados(),
             'Se reportó como turno sin evento uno que sí tiene su evento, en el calendario de '
             .'su propio dueño.');
 
-        // El id se compara como string: `tenant_id` es UUID y un `(int)` sobre un
-        // UUID devuelve 1 para todos, con lo que la afirmación pasaría siempre.
+        // Los ids se comparan como string: `tenant_id` es UUID y un `(int)` sobre
+        // un UUID devuelve 1 para todos, con lo que estas afirmaciones pasarían
+        // siempre — incluso con la fuga presente.
         $this->assertSame($this->tenant->id, (string) $fila?->tenant_id);
         $this->assertNotSame($otro->id, (string) $fila?->tenant_id);
+
+        $this->assertSame($otro->id, (string) $deNorte->tenant_id,
+            'El hallazgo quedó a nombre de la PyME equivocada: lo va a ver en su panel un '
+            .'negocio al que no le pertenece, con el nombre y el teléfono de la clienta.');
+
+        $this->assertSame(1, $this->totalDeHallazgos(),
+            'La corrida generó hallazgos de más: alguno es de un turno sano o está duplicado.');
     }
 
     /**
-     * § 9 · Un turno **ya cancelado** no se vuelve a cancelar ni se reporta otra
-     * vez.
+     * § 9 · Un turno **ya cancelado** no se reporta ni queda en duda.
      *
      * Un turno cancelado no tiene evento en el calendario **por definición**: la
-     * cancelación lo borra. Si la conciliación no los excluyera, cada corrida
-     * —cada quince minutos, para siempre— reportaría de nuevo todos los turnos
-     * cancelados en la historia de la PyME. El log dejaría de servir para contar
-     * cuántos desalineados hubo, que es lo único para lo que sirve hoy.
+     * cancelación lo borra. Si el barrido inverso no los excluyera, la **primera**
+     * corrida dejaría un hallazgo pendiente por **cada** turno cancelado en la
+     * historia de la PyME, y el dueño abriría la pantalla el día uno con cientos
+     * de filas que no hay que resolver. El log, además, dejaría de servir para
+     * contar cuántos desalineados hubo.
      *
      * El turno vivo que acompaña es el canario: sin él, un comando que no hace
      * nada pasa este test.
+     *
+     * ## Expectativa vieja, no regresión — **y el nombre también cambió**
+     *
+     * Antes solo miraba el log, y se llamaba `no_vuelve_a_reportar_...` porque el
+     * daño era la **repetición**: cada quince minutos, para siempre, todos los
+     * cancelados de la historia otra vez.
+     *
+     * Con el modelo nuevo el énfasis se corrió, y por eso el nombre pasa a
+     * `no_reporta_...`. **El daño ya no es repetir, es la primera vez.** El
+     * candado de `reconciliation_findings` es único por turno y **no lo suelta al
+     * resolverse**, así que las filas basura no se repiten — se escriben una vez y
+     * se quedan, y hay que resolverlas a mano una por una. Un hallazgo de más
+     * cuesta más caro que noventa y seis líneas de log de más.
+     *
+     * La mitad del log conserva el sentido viejo —ahí no hay candado y sí se
+     * repetiría para siempre—, así que las dos afirmaciones siguen valiendo por
+     * motivos distintos y ninguna sobra.
      */
-    public function test_no_vuelve_a_reportar_un_turno_que_ya_estaba_cancelado(): void
+    public function test_no_reporta_un_turno_que_ya_estaba_cancelado(): void
     {
         $this->fakeDeGoogle();
 
@@ -1380,6 +1613,14 @@ class ConciliacionDeAgendamientoTest extends TestCase
         $this->turnoEnLaBase($this->tenant, 'evt_recien_borrado', 'Ana');
 
         $this->conciliar();
+
+        $this->assertTrue($this->quedoEnDuda($this->tenant, 'evt_recien_borrado'),
+            'Canario: el turno vivo que perdió su evento no generó hallazgo, así que lo que '
+            .'este test afirma sobre el turno ya cancelado no distingue nada.');
+
+        $this->assertFalse($this->quedoEnDuda($this->tenant, 'evt_ya_cancelado'),
+            'Un turno cancelado hace rato quedó pidiendo revisión: la pantalla nace con toda '
+            .'la historia de cancelaciones de la PyME y no la mira nadie.');
 
         $this->assertSame(['evt_recien_borrado'], $this->turnosSinEventoReportados(),
             'Un turno ya cancelado se reportó como desalineado: cada corrida va a repetir todos '

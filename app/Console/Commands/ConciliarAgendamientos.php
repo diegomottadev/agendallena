@@ -4,11 +4,13 @@ namespace App\Console\Commands;
 
 use App\Models\Booking;
 use App\Models\Integration;
+use App\Models\ReconciliationFinding;
 use App\Models\Tenant;
 use App\Services\Google\CalendarioDeGoogle;
 use App\Support\TenantContext;
 use Carbon\CarbonImmutable;
 use Illuminate\Console\Command;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 
@@ -45,14 +47,25 @@ use Illuminate\Support\Facades\Log;
  * calendario**: el dueño lo borró a mano desde su propio Google Calendar,
  * seguramente porque el cliente lo llamó por teléfono. Para él ese turno no
  * existe; para nosotros sigue ocupando la agenda y **entra en la tasa de
- * ausentismo**, que es el número con el que se vende el producto. Ese turno
- * **se cancela**, y a diferencia del huérfano acá sí se escribe en la base.
+ * ausentismo**, que es el número con el que se vende el producto.
+ *
+ * ## 🔄 Ese turno **queda en duda, no se cancela** (2026-08-21)
+ *
+ * Antes esta corrida lo cancelaba sola. Cancelar en silencio deja al cliente sin
+ * enterarse —tiene la confirmación en el celular y llega a la puerta—, y
+ * avisarle automáticamente choca con la ventana de 24 h de Meta, que exige una
+ * plantilla aprobada que no existe. Ahora la corrida **no decide**: escribe un
+ * hallazgo pendiente en `reconciliation_findings` y lo resuelve una persona
+ * desde `/panel/turnos-en-duda` —mantener o cancelar—, que si hace falta llama
+ * al cliente desde el número de atención humana. **El cliente no recibe nada
+ * automático.**
  *
  * Ahí la asimetría manda: para el huérfano equivocarse cuesta una línea de log
- * de más, para la cancelación cuesta la agenda de una PyME. Por eso el barrido
- * inverso se apoya en el mismo listado que ya se pidió —nunca en un `GET` por
- * turno, que además no mira la marca `origen` y daría por vivo un evento que el
- * dueño cargó a mano— y **un calendario que no se pudo leer no cancela nada**.
+ * de más, para el hallazgo cuesta una fila que alguien tiene que atender a mano
+ * y que el candado no vuelve a ofrecer. Por eso el barrido inverso se apoya en
+ * el mismo listado que ya se pidió —nunca en un `GET` por turno, que además no
+ * mira la marca `origen` y daría por vivo un evento que el dueño cargó a mano— y
+ * **un calendario que no se pudo leer no deja en duda nada**.
  *
  * Corre desde el scheduler; ver `routes/console.php`.
  */
@@ -60,7 +73,17 @@ class ConciliarAgendamientos extends Command
 {
     protected $signature = 'agendamientos:conciliar';
 
-    protected $description = 'Reporta los eventos de Google sin fila y cancela los turnos cuyo evento ya no está';
+    protected $description = 'Reporta los eventos de Google sin fila y deja en duda los turnos cuyo evento ya no está';
+
+    /**
+     * Turnos que la corrida volvió a ver en duda y ya tenían su hallazgo.
+     *
+     * Es el caso normal —el desalineado no se arregla solo— y por eso no se
+     * registra fila por fila: se cuenta acá y sale en el resumen, para que una
+     * corrida que no encontró nada nuevo no se lea como una corrida que no hizo
+     * nada (RNF-03).
+     */
+    private int $yaEstabanEnDuda = 0;
 
     /**
      * ⚠️ **La ventana no la fija ningún documento.**
@@ -84,6 +107,28 @@ class ConciliarAgendamientos extends Command
      */
     public const MINUTOS_ENTRE_CORRIDAS = 15;
 
+    /**
+     * Cuántas PyMEs se resuelven de una vez.
+     *
+     * El `cursor()` que había acá traía los tenants de a uno y le preguntaba a
+     * `integrations` en qué calendario entrar, una vez por PyME y cada quince
+     * minutos. Se resuelve por lote y no sobre la cartera entera: el recorrido no
+     * tiene ventana que lo acote —son todas las PyMEs—, así que el lote es lo que
+     * impide cambiar un problema de consultas por uno de memoria.
+     */
+    private const PYMES_POR_LOTE = 200;
+
+    /**
+     * Cuántos ids de evento entran en un `whereIn` al cruzar contra `bookings`.
+     *
+     * Antes se preguntaba **uno por evento**: dos consultas con un evento, once
+     * con diez, y el multiplicador no es la cantidad de PyMEs sino la cantidad de
+     * turnos que la PyME agendó — crece con el éxito del producto. El corte existe
+     * porque el listado de Google puede traer cientos de eventos y un `whereIn` de
+     * ese tamaño deja de ser una consulta y pasa a ser un problema.
+     */
+    private const EVENTOS_POR_CONSULTA = 500;
+
     public function handle(CalendarioDeGoogle $calendario): int
     {
         $ahora = CarbonImmutable::now('UTC');
@@ -92,7 +137,7 @@ class ConciliarAgendamientos extends Command
         $hasta = $ahora->addDays(self::DIAS_HACIA_ADELANTE);
 
         $desalineados = 0;
-        $cancelados = 0;
+        $enDuda = 0;
         $revisados = 0;
 
         /*
@@ -101,40 +146,85 @@ class ConciliarAgendamientos extends Command
          * tenant. De acá en adelante **cada PyME se revisa dentro de su propio
          * `runAs()`**, para que el Global Scope filtre las filas por sí mismo
          * (RNF-01).
+         *
+         * El `id` de desempate lo pide el recorrido por lotes: sin un orden total,
+         * dos altas del mismo segundo pueden caer en dos lotes o en ninguno.
          */
-        foreach (Tenant::query()->orderBy('created_at')->cursor() as $tenant) {
-            $google = Integration::query()
-                ->where('tenant_id', $tenant->id)
-                ->where('provider', Integration::PROVIDER_GOOGLE_CALENDAR)
-                ->first();
+        $recorrido = Tenant::query()->orderBy('created_at')->orderBy('id');
 
-            // Sin calendario conectado no hay nada que conciliar. No es un fallo:
-            // es una PyME que todavía no terminó el alta.
-            if ($google === null) {
-                continue;
+        $recorrido->chunk(self::PYMES_POR_LOTE, function ($tenants) use (
+            $calendario, $ahora, $desde, $hasta, &$desalineados, &$enDuda, &$revisados
+        ): void {
+            $calendarios = $this->calendariosDe($tenants);
+
+            foreach ($tenants as $tenant) {
+                $google = $calendarios[(string) $tenant->id] ?? null;
+
+                // Sin calendario conectado no hay nada que conciliar. No es un fallo:
+                // es una PyME que todavía no terminó el alta.
+                if ($google === null) {
+                    continue;
+                }
+
+                $revisados++;
+
+                [$huerfanos, $dudosos] = TenantContext::runAs(
+                    (string) $tenant->id,
+                    fn () => $this->conciliarTenant($calendario, $tenant, $google, $ahora, $desde, $hasta),
+                );
+
+                $desalineados += $huerfanos;
+                $enDuda += $dudosos;
             }
+        });
 
-            $revisados++;
-
-            [$huerfanos, $caidos] = TenantContext::runAs(
-                (string) $tenant->id,
-                fn () => $this->conciliarTenant($calendario, $tenant, $google, $ahora, $desde, $hasta),
-            );
-
-            $desalineados += $huerfanos;
-            $cancelados += $caidos;
-        }
-
-        $this->info("Desalineados reportados: {$desalineados} · turnos cancelados sin evento: "
-            ."{$cancelados} · calendarios revisados: {$revisados}");
+        $this->info("Desalineados reportados: {$desalineados} · turnos que quedaron en duda: "
+            ."{$enDuda} · ya estaban en duda: {$this->yaEstabanEnDuda} · calendarios revisados: {$revisados}");
 
         return self::SUCCESS;
     }
 
     /**
+     * El calendario conectado de cada PyME del lote, en una sola consulta.
+     *
+     * ⚠️ Lectura cross-tenant, como el recorrido que la envuelve. El aislamiento
+     * lo da el mapa: se indexa por `tenant_id` —UUID, comparado como string— y
+     * cada PyME solo alcanza su propia entrada. Entrar al calendario equivocado
+     * sería reportar como huérfano todo lo de otra cartera y, peor, dejarle en
+     * duda turnos vivos que están sanos (RNF-01).
+     *
+     * @param  Collection<int,Tenant>  $tenants
+     * @return array<string,Integration>
+     */
+    private function calendariosDe(Collection $tenants): array
+    {
+        $ids = $tenants->pluck('id')->map(static fn ($id): string => (string) $id)->all();
+
+        if ($ids === []) {
+            return [];
+        }
+
+        $calendarios = [];
+
+        $filas = Integration::query()
+            ->whereIn('tenant_id', $ids)
+            ->where('provider', Integration::PROVIDER_GOOGLE_CALENDAR)
+            // El `first()` que esto reemplaza no tenía orden: se fija uno para que
+            // la PyME con dos calendarios conectados elija siempre el mismo.
+            ->orderBy('id')
+            ->get();
+
+        foreach ($filas as $integracion) {
+            $calendarios[(string) $integracion->tenant_id] ??= $integracion;
+        }
+
+        return $calendarios;
+    }
+
+    /**
      * Las dos direcciones de este tenant, con **un solo listado a Google**.
      *
-     * @return array{0:int,1:int} Huérfanos reportados y turnos cancelados.
+     * @return array{0:int,1:int} Huérfanos reportados y turnos que quedaron en duda.
      */
     private function conciliarTenant(
         CalendarioDeGoogle $calendario,
@@ -167,9 +257,11 @@ class ConciliarAgendamientos extends Command
         /*
          * `null` es "no se pudo leer", y ya quedó registrado adentro. Un
          * calendario que no se pudo leer no autoriza a concluir que está sano —y
-         * mucho menos a cancelar: media hora de Google contestando 500 le
-         * borraría a la PyME los turnos de los dos meses siguientes en dos
-         * corridas, con la confirmación ya en el celular de cada cliente.
+         * mucho menos a dejar turnos en duda: media hora de Google contestando
+         * 500 le llenaría la pantalla a la PyME con los turnos de los dos meses
+         * siguientes, en dos corridas y sin que nadie toque nada. Y el candado lo
+         * empeora: esos hallazgos son uno por turno y para siempre, así que hay
+         * que resolverlos a mano uno por uno.
          */
         if ($eventos === null) {
             return [0, 0];
@@ -183,6 +275,15 @@ class ConciliarAgendamientos extends Command
 
         $reportados = 0;
 
+        /*
+         * Qué eventos ya tienen su fila, preguntado **una vez por listado** y no
+         * una vez por evento. Es el mismo patrón que esta clase ya usa del lado de
+         * Google —cruzar contra lo que se trajo en vez de pedir de a uno— y el que
+         * `AsistenciaController::turnosConRecordatorio()` usa del lado de la base:
+         * un `whereIn` y un mapa en memoria.
+         */
+        $conFila = $this->filasDeEsosEventos($tenant, $eventos);
+
         foreach ($eventos as $evento) {
             $eventId = (string) ($evento['id'] ?? '');
 
@@ -190,7 +291,7 @@ class ConciliarAgendamientos extends Command
                 continue;
             }
 
-            if ($this->tieneSuFila($tenant, $eventId)) {
+            if (isset($conFila[$eventId])) {
                 continue;
             }
 
@@ -216,9 +317,10 @@ class ConciliarAgendamientos extends Command
          * página intermedia. Para los huérfanos eso cuesta un reporte perdido y por eso
          * esa dirección **sí corrió** recién, con lo que se haya leído. Para el
          * barrido inverso cuesta turnos reales: lo que quedó en la página que no
-         * se leyó es indistinguible de lo que no existe, y cancelaríamos turnos
-         * vivos con la confirmación ya en el celular del cliente —cada quince
-         * minutos, para siempre—. Es la misma regla que el 500 y que la ventana:
+         * se leyó es indistinguible de lo que no existe, y dejaríamos en duda la
+         * agenda entera de esa PyME —una lista de basura que nadie va a poder
+         * distinguir de la real, porque el candado no la vuelve a ofrecer—. Es la
+         * misma regla que el 500 y que la ventana:
          * **no haber mirado no es haber verificado que no está.**
          *
          * El freno es de **este tenant**, no de la corrida: una PyME grande no
@@ -242,7 +344,7 @@ class ConciliarAgendamientos extends Command
             return [$reportados, 0];
         }
 
-        return [$reportados, $this->cancelarTurnosSinEvento($tenant, $eventos, $ahora, $hasta)];
+        return [$reportados, $this->dejarEnDudaLosTurnosSinEvento($tenant, $eventos, $ahora, $hasta)];
     }
 
     /**
@@ -254,10 +356,22 @@ class ConciliarAgendamientos extends Command
      * además un `GET` por id no mira la marca `origen`, así que daría por vivo
      * un evento que el dueño cargó a mano.
      *
+     * ## El turno **no se toca**: queda en duda
+     *
+     * Decisión del 2026-08-21. Antes esta misma función lo cancelaba, y el
+     * cliente no se enteraba: tiene la confirmación en el celular y llega a la
+     * puerta. Avisarle automáticamente tampoco se puede —fuera de las 24 h de
+     * Meta hace falta una plantilla aprobada que no existe—, así que la corrida
+     * deja de decidir: escribe un hallazgo pendiente y lo resuelve una persona
+     * desde el panel, que si hace falta llama al cliente desde el número de
+     * atención humana.
+     *
+     * Ni `status` ni `attendance` se tocan acá.
+     *
      * @param  array<int,array<string,mixed>>  $eventos  Lo que Google devolvió.
-     * @return int Cuántos turnos se cancelaron.
+     * @return int Cuántos turnos quedaron en duda por primera vez.
      */
-    private function cancelarTurnosSinEvento(
+    private function dejarEnDudaLosTurnosSinEvento(
         Tenant $tenant,
         array $eventos,
         CarbonImmutable $ahora,
@@ -269,64 +383,102 @@ class ConciliarAgendamientos extends Command
             $enElCalendario[(string) ($evento['id'] ?? '')] = true;
         }
 
-        $cancelados = 0;
+        $enDuda = 0;
 
         foreach ($this->turnosVivosEnLaVentana($tenant, $ahora, $hasta) as $turno) {
             if (isset($enElCalendario[(string) $turno->external_event_id])) {
                 continue;
             }
 
-            /*
-             * Se toca **solo** `status`. `attendance` es ortogonal a propósito
-             * (T-036): a un turno que el dueño borró de su calendario nadie lo
-             * esperó, y marcarlo `no_show` haría que cada limpieza suya le suba
-             * la tasa de ausentismo, que es el número con el que se vende.
-             */
-            $turno->status = Booking::ESTADO_CANCELADO;
-
-            try {
-                $turno->save();
-            } catch (\Throwable $e) {
-                /*
-                 * RNF-03 · Un deadlock o una base que se cae un segundo **no
-                 * puede llevarse puesta la corrida**: sin este `catch` la
-                 * excepción sube hasta `handle()`, las PyMEs que faltaban se
-                 * quedan sin conciliar y ni siquiera se imprime el resumen, así
-                 * que el síntoma desde afuera es que no pasó nada.
-                 *
-                 * Se sigue **con el turno siguiente** y no con la PyME siguiente:
-                 * el que no se pudo guardar es uno, y los demás de esta misma
-                 * PyME siguen mereciendo su barrido. La corrida de dentro de
-                 * quince minutos lo reintenta solo — el turno quedó vivo, que es
-                 * el lado seguro del error.
-                 */
-                Log::error('No se pudo cancelar el turno cuyo evento ya no está', [
-                    'tenant_id' => $tenant->id,
-                    'external_event_id' => (string) $turno->external_event_id,
-                    'integracion' => 'google_calendar',
-                    'codigo' => 'CONCILIACION_CANCELACION_FALLIDA',
-                    'excepcion' => $e::class,
-                ]);
-
-                continue;
+            if ($this->dejarEnDuda($tenant, $turno)) {
+                $enDuda++;
             }
+        }
 
-            // Código propio, distinto del huérfano: son dos situaciones que se
-            // resuelven distinto y quien lea el log tiene que poder separarlas.
-            // Va **después** del `save()`: reportar como cancelado un turno que
-            // sigue vivo mandaría a auditar un cambio que nunca ocurrió.
-            Log::warning('Turno vivo cuyo evento ya no está en el calendario', [
+        return $enDuda;
+    }
+
+    /**
+     * Un hallazgo pendiente por ese turno. `false` si ya estaba en duda o falló.
+     *
+     * ## Se escribe **por el modelo** y sin `SELECT` previo
+     *
+     * Por el modelo —y no con un `insertOrIgnore()` del query builder ni con un
+     * `insert()` masivo— porque esos caminos no disparan los eventos de Eloquent,
+     * y con ellos se pierde el `creating` que pone el `tenant_id` del contexto
+     * (RNF-01).
+     *
+     * Y sin preguntar antes: *"fijate si ya hay un hallazgo de este turno"* deja
+     * abierta la ventana entre el `SELECT` y el `INSERT`, y dos workers que
+     * concilian a la vez la pasan los dos. **El duplicado lo rechaza el único
+     * `(tenant_id, type, booking_id)`**, y ese rechazo es el camino normal: la
+     * corrida ve el mismo desalineado cada quince minutos porque no se arregla
+     * solo — ni siquiera cuando alguien resuelve *mantener*, que no recrea nada
+     * en Google.
+     */
+    private function dejarEnDuda(Tenant $tenant, Booking $turno): bool
+    {
+        try {
+            ReconciliationFinding::create([
+                'tenant_id' => $tenant->id,
+                'booking_id' => $turno->id,
+                'type' => ReconciliationFinding::TIPO_TURNO_SIN_EVENTO,
+                'detected_at' => CarbonImmutable::now('UTC'),
+            ]);
+        } catch (UniqueConstraintViolationException) {
+            /*
+             * El candado hizo su trabajo: ese turno ya está en duda —o ya lo
+             * resolvió alguien, que retiene el único igual—. No es un error y no
+             * se registra: son 96 corridas por día y la línea diría siempre lo
+             * mismo. Se cuenta en el resumen del comando, que es donde el
+             * operador mira cuánto trabajo hizo la pasada.
+             */
+            $this->yaEstabanEnDuda++;
+
+            return false;
+        } catch (\Throwable $e) {
+            /*
+             * RNF-03 · Un deadlock o una base que se cae un segundo **no puede
+             * llevarse puesta la corrida**: sin este `catch` la excepción sube
+             * hasta `handle()`, las PyMEs que faltaban se quedan sin conciliar y
+             * ni siquiera se imprime el resumen, así que el síntoma desde afuera
+             * es que no pasó nada.
+             *
+             * Se sigue **con el turno siguiente** y no con la PyME siguiente: el
+             * que no se pudo guardar es uno, y los demás de esta misma PyME
+             * siguen mereciendo su barrido. La corrida de dentro de quince
+             * minutos lo reintenta sola.
+             */
+            Log::error('No se pudo dejar en duda el turno cuyo evento ya no está', [
                 'tenant_id' => $tenant->id,
                 'external_event_id' => (string) $turno->external_event_id,
                 'integracion' => 'google_calendar',
-                'codigo' => 'CONCILIACION_TURNO_SIN_EVENTO',
-                'inicio' => $turno->start_time?->toIso8601String(),
+                'codigo' => 'CONCILIACION_HALLAZGO_FALLIDO',
+                'excepcion' => $e::class,
             ]);
 
-            $cancelados++;
+            return false;
         }
 
-        return $cancelados;
+        /*
+         * Código propio, distinto del huérfano: son dos situaciones que se
+         * resuelven distinto y quien lea el log tiene que poder separarlas.
+         *
+         * Va **después** del `create()` y solo cuando la fila entró: es el rastro
+         * de que la corrida detectó un desalineado nuevo. Escribirlo también en
+         * el duplicado convertiría cada turno en duda sin resolver en 96 líneas
+         * diarias idénticas, y el reporte dejaría de servir para contar cuántos
+         * desalineados hubo.
+         */
+        Log::warning('Turno vivo cuyo evento ya no está en el calendario', [
+            'tenant_id' => $tenant->id,
+            'external_event_id' => (string) $turno->external_event_id,
+            'integracion' => 'google_calendar',
+            'codigo' => 'CONCILIACION_TURNO_SIN_EVENTO',
+            'inicio' => $turno->start_time?->toIso8601String(),
+        ]);
+
+        return true;
     }
 
     /**
@@ -336,22 +488,23 @@ class ConciliarAgendamientos extends Command
      *
      * - **La misma ventana que el listado.** De un turno a 80 días la corrida no
      *   tiene ninguna información: no lo pidió. Sin este corte, cada pasada
-     *   cancelaría todos los turnos lejanos por no haberlos consultado —los que
-     *   la PyME agenda con más anticipación—.
+     *   dejaría en duda todos los turnos lejanos por no haberlos consultado —los
+     *   que la PyME agenda con más anticipación—.
      * - **`start_time` todavía futuro.** ⚠️ Decisión del team-lead del
      *   2026-08-21, **pendiente de que Diego la ratifique**: § 9 no lo dice. Los
      *   dos daños que § 9 nombra no aplican hacia atrás —un turno pasado no
-     *   ocupa nada— y es peor que inútil: la tasa se calcula sobre los turnos
-     *   marcados, así que cancelar hacia atrás saca turnos de la métrica en
-     *   silencio. Borrar un evento viejo del calendario es higiene; borrar uno
-     *   futuro es una decisión sobre un turno, y solo eso vale interpretar.
+     *   ocupa nada— y llenar la pantalla de turnos viejos que el dueño ya
+     *   limpió es la vía más rápida a que deje de mirarla. Borrar un evento
+     *   viejo del calendario es higiene; borrar uno futuro es una decisión sobre
+     *   un turno, y solo eso vale interpretar.
      * - **No cancelado ya.** Un turno cancelado no tiene evento *por definición*.
      *   Sin excluirlos, cada corrida repetiría todos los cancelados de la
      *   historia y el reporte dejaría de decir cuántos desalineados hubo.
      *
      * El `where('tenant_id')` va explícito además del Global Scope: una consulta
      * que trajera la fila de otra PyME la cruzaría contra el calendario
-     * equivocado —donde obviamente no está— y le cancelaría un turno real
+     * equivocado —donde obviamente no está— y le dejaría en duda un turno sano,
+     * con el nombre y el teléfono de esa clienta a la vista del otro negocio
      * (RNF-01).
      *
      * @return Collection<int,Booking>
@@ -372,18 +525,45 @@ class ConciliarAgendamientos extends Command
     }
 
     /**
-     * ¿Hay una fila **de este tenant** que reclame el evento?
+     * Cuáles de esos eventos **ya tienen una fila de este tenant** que los reclame.
      *
      * El `where('tenant_id')` es explícito además del Global Scope, y no es
      * redundancia: si esta consulta encontrara la fila de otra PyME —Google no
      * garantiza `id` distintos entre cuentas—, daría por sano un huérfano y el
      * desalineado quedaría invisible **por una fuga entre tenants**.
+     *
+     * Se parte en tandas porque el listado de una PyME con la agenda llena puede
+     * traer cientos de eventos: el costo deja de crecer por evento sin volverse un
+     * `whereIn` sin techo.
+     *
+     * @param  array<int,array<string,mixed>>  $eventos
+     * @return array<string,true>
      */
-    private function tieneSuFila(Tenant $tenant, string $eventId): bool
+    private function filasDeEsosEventos(Tenant $tenant, array $eventos): array
     {
-        return Booking::query()
-            ->where('tenant_id', $tenant->id)
-            ->where('external_event_id', $eventId)
-            ->exists();
+        $ids = [];
+
+        foreach ($eventos as $evento) {
+            $eventId = (string) ($evento['id'] ?? '');
+
+            if ($eventId !== '') {
+                $ids[$eventId] = true;
+            }
+        }
+
+        $conFila = [];
+
+        foreach (array_chunk(array_keys($ids), self::EVENTOS_POR_CONSULTA) as $tanda) {
+            $encontrados = Booking::query()
+                ->where('tenant_id', $tenant->id)
+                ->whereIn('external_event_id', $tanda)
+                ->pluck('external_event_id');
+
+            foreach ($encontrados as $eventId) {
+                $conFila[(string) $eventId] = true;
+            }
+        }
+
+        return $conFila;
     }
 }

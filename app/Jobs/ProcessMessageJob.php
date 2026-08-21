@@ -260,17 +260,24 @@ class ProcessMessageJob implements ShouldQueue
      * tasa de ausentismo de T-038 compara *"le avisamos"* contra *"no vino"*
      * usando un *"le avisamos"* que en realidad quiere decir *"lo intentamos"*.
      *
-     * ## ⚠️ Este manejador puede nacer muerto, y ningun test lo puede ver
+     * ## No hace falta suscribir nada nuevo en Meta
      *
-     * **Falta un paso fuera del codigo:** la suscripcion del webhook en la
-     * consola de Meta entrega hoy el campo `messages`, **no `statuses`**. Con el
-     * manejador escrito y la suite entera en verde, este metodo **no recibe un
-     * solo evento** hasta que alguien agregue esa suscripcion del lado de Meta.
+     * ⚠️ **Corregido el 2026-08-21: durante un rato se creyo lo contrario**, y
+     * este mismo docblock afirmaba que el manejador iba a nacer muerto hasta que
+     * alguien tocara la consola de Meta. Era falso, y el error es facil de
+     * repetir: **`statuses` NO es un campo de webhook.**
      *
-     * Es la misma forma del bug de `AltaDeCuenta`, que estuvo sin ningun llamador
-     * en produccion mientras sus tests pasaban: **una suite verde no prueba que
-     * el codigo se use.** Si `notification_logs` no sale nunca de `sent`, revisar
-     * la suscripcion **antes** de depurar esta funcion.
+     * En Cloud API el campo se llama **`messages`**, y ese unico campo entrega
+     * los dos arrays en el mismo cambio: `value.messages[]` con lo que entra y
+     * `value.statuses[]` con los acuses. Confirmado con Diego el 2026-08-21: la
+     * app esta suscrita a `messages`, o sea que **estos eventos ya venian
+     * llegando** y se descartaban aca, no en Meta.
+     *
+     * Lo que **si** es un campo aparte y **no** esta suscrito es
+     * `message_template_status_update`, el que avisa cuando Meta aprueba una
+     * plantilla. Por eso existe la tarea `plantillas:sincronizar`, que le
+     * pregunta a Meta cada 15 minutos en vez de esperar que Meta avise. **No lo
+     * confundas con este camino.**
      *
      * ## ⚠️ Que pasa con `sent_at` cuando el `failed` llega por webhook
      *
@@ -289,10 +296,16 @@ class ProcessMessageJob implements ShouldQueue
      * ⚠️ **La deduplicacion no aplica aca.** Los `statuses` no traen id propio,
      * asi que `processed_messages` no les sirve. Reprocesar el mismo estado
      * escribe el mismo valor: es idempotente por ser una asignacion y no un
-     * incremento. Lo que **no** esta resuelto es el orden —Meta no lo garantiza,
-     * y un `delivered` que llega despues de un `read` deja el registro
-     * retrocedido—; que los estados tengan que avanzar en un solo sentido es una
-     * decision que nadie tomo.
+     * incremento.
+     *
+     * ## El orden, que Meta no garantiza
+     *
+     * ⚠️ **Resuelto el 2026-08-21 por decision del team lead, pendiente de que
+     * Diego la ratifique.** Los estados avanzan en un solo sentido —`queued` →
+     * `sent` → `delivered` → `read`— y lo que llega tarde se descarta con un
+     * `Log::info` (`META_ESTADO_FUERA_DE_ORDEN`). `failed` esta fuera de esa
+     * progresion: gana sobre las cuatro y es terminal. El ranking vive en
+     * `NotificationLog::AVANCE_DE_ESTADOS`.
      *
      * @param  array<string,mixed>  $status
      */
@@ -352,6 +365,42 @@ class ProcessMessageJob implements ShouldQueue
             return;
         }
 
+        /*
+         * ⚠️ **Decision del team lead del 2026-08-21, pendiente de que Diego la
+         * ratifique**: ningun documento la escribe.
+         *
+         * Un `failed` es terminal. Un `sent` o un `delivered` reentregado que
+         * llega despues no puede "curar" un rebote: si lo curara, el turno
+         * volveria a figurar avisado, el dueno no llamaria al cliente y el
+         * horario se perderia sin rastro de por que. Se corta antes de armar
+         * los cambios para que la reentrega de un `failed` **tampoco** pise
+         * `failed_at` ni `failure_reason` con los del reproceso: `failed_at` es
+         * *cuando rebotó*, y con eso el dueno decide si todavia llega a llamar.
+         */
+        if ($registro->status === NotificationLog::ESTADO_FALLIDO) {
+            $this->registrarEstadoFueraDeOrden($integration->tenant_id, $registro->status, $estado);
+
+            return;
+        }
+
+        /*
+         * El avance es en un solo sentido: `queued` → `sent` → `delivered` →
+         * `read`. Un estado de rango menor o igual al que ya tiene la fila
+         * llego tarde y se descarta. Sin esto, un `delivered` demorado borraba
+         * el `read`, que es el dato con el que T-038 separa al cliente que vio
+         * el aviso y no vino del que nunca lo vio.
+         *
+         * `failed` esta fuera del ranking y gana: es la unica informacion
+         * accionable para el dueno —numero equivocado, cliente que bloqueo— y
+         * sin ella el turno figura avisado y no lo esta.
+         */
+        if ($estado !== NotificationLog::ESTADO_FALLIDO
+            && $this->rangoDelEstado($estado) <= $this->rangoDelEstado($registro->status)) {
+            $this->registrarEstadoFueraDeOrden($integration->tenant_id, $registro->status, $estado);
+
+            return;
+        }
+
         $cambios = ['status' => $estado];
 
         if ($estado === NotificationLog::ESTADO_FALLIDO) {
@@ -366,6 +415,37 @@ class ProcessMessageJob implements ShouldQueue
         }
 
         $registro->forceFill($cambios)->save();
+    }
+
+    /**
+     * En que escalon de la progresion cae un estado.
+     *
+     * El `-1` cubre un valor que no este en el ranking —hoy solo `failed`, que
+     * nunca llega hasta aca— y lo deja por debajo de todo: ante la duda, el
+     * estado entrante avanza en vez de perderse.
+     */
+    private function rangoDelEstado(?string $estado): int
+    {
+        return NotificationLog::AVANCE_DE_ESTADOS[$estado] ?? -1;
+    }
+
+    /**
+     * RNF-03 · Un estado descartado por llegar fuera de orden no puede terminar
+     * en silencio.
+     *
+     * `info` y no `warning` porque es **esperable**: Meta no promete el orden y
+     * reordenar acuses no es un problema. Se registra igual porque *cuan
+     * seguido* pasa es justo lo que el piloto tiene que poder contar, y hoy no
+     * hay ninguna otra forma de saberlo.
+     */
+    private function registrarEstadoFueraDeOrden(string $tenantId, ?string $actual, string $entrante): void
+    {
+        Log::info('Estado de Meta descartado por llegar fuera de orden', [
+            'tenant_id' => $tenantId,
+            'estado_actual' => $actual,
+            'estado_entrante' => $entrante,
+            'codigo' => 'META_ESTADO_FUERA_DE_ORDEN',
+        ]);
     }
 
     /**

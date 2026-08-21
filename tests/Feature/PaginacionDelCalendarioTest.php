@@ -244,6 +244,27 @@ class PaginacionDelCalendarioTest extends TestCase
      * emitió se contesta con `400`, igual que Google. Una implementación que
      * «pagine» volviendo a pedir la primera página no puede pasar por completa.
      */
+    /**
+     * ¿La conciliación dejó este turno **en duda**?
+     *
+     * Se lee crudo con `DB::table()`: un Global Scope podría esconder justo la
+     * fila que el test quiere ver, y una fuga entre tenants se leería como «no
+     * pasó nada».
+     */
+    private function dejoHallazgo(Tenant $tenant, string $eventId): bool
+    {
+        $turno = $this->filaCruda($tenant, $eventId);
+
+        if ($turno === null) {
+            return false;
+        }
+
+        return \Illuminate\Support\Facades\DB::table('reconciliation_findings')
+            ->where('tenant_id', (string) $tenant->id)
+            ->where('booking_id', $turno->id)
+            ->exists();
+    }
+
     private function fakeDeGoogle(): void
     {
         Http::fake([
@@ -516,9 +537,15 @@ class PaginacionDelCalendarioTest extends TestCase
      * cada quince minutos.
      *
      * El canario es un turno cuyo evento **no está en ninguna página**: ese sí
-     * tiene que cancelarse en la misma corrida. Sin él, «no canceló» lo pasa
-     * cualquier implementación que no cancele nada nunca — que es exactamente la
-     * protección que hay hoy.
+     * tiene que quedar en duda en la misma corrida. Sin él, «no lo dejó en duda»
+     * lo pasa cualquier implementación que no haga nada nunca.
+     *
+     * ## Expectativa vieja, no regresión
+     *
+     * El canario afirmaba `status == cancelled`. La conciliación **dejó de
+     * cancelar** el 2026-08-21 (decisión de Diego, § 18 de `decisiones-tomadas.md`):
+     * ahora deja el turno en duda y lo resuelve una persona. Cambió el predicado
+     * con el que se observa, no lo que el test protege.
      */
     public function test_el_turno_cuyo_evento_esta_en_la_segunda_pagina_no_se_cancela(): void
     {
@@ -537,10 +564,15 @@ class PaginacionDelCalendarioTest extends TestCase
             'Se canceló un turno vivo porque su evento estaba en la segunda página: el cliente ya '
             .'tiene la confirmación en el celular y nadie lo va a atender.');
 
-        $this->assertSame(Booking::ESTADO_CANCELADO,
-            $this->filaCruda($this->tenant, 'evt_que_el_duenio_borro')?->status,
+        $this->assertTrue(
+            $this->dejoHallazgo($this->tenant, 'evt_que_el_duenio_borro'),
             'Canario: el barrido inverso no corrió, así que este test no distingue nada — es el '
             .'mismo estado en el que la PyME grande está hoy.');
+
+        $this->assertFalse(
+            $this->dejoHallazgo($this->tenant, 'evt_pagina_dos'),
+            'Se dejó en duda un turno vivo porque su evento estaba en la segunda página: alguien '
+            .'del equipo va a tener que resolver a mano un turno que nunca tuvo nada malo.');
 
         $this->assertSame([], $this->inversaOmitida,
             'La conciliación se saltó el barrido inverso de una PyME cuyo calendario se leyó '

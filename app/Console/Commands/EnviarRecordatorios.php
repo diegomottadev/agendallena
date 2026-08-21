@@ -16,6 +16,7 @@ use App\Support\TenantContext;
 use Carbon\CarbonImmutable;
 use Illuminate\Console\Command;
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -87,12 +88,21 @@ class EnviarRecordatorios extends Command
             ->orderBy('start_time')
             ->get();
 
+        /*
+         * El contexto de **toda la ventana**, de una sola vez. Antes cada turno
+         * volvía a preguntar de quién era, con qué se manda y con quién se habla:
+         * siete lecturas por turno, cada diez minutos, sobre toda la cartera. La
+         * peluquería con la agenda llena mete diez turnos en la misma ventana y
+         * los diez comparten el mismo tenant y la misma integración.
+         */
+        $contexto = $this->contextoDe($turnos);
+
         $enviados = 0;
 
         foreach ($turnos as $booking) {
             $salio = TenantContext::runAs(
                 (string) $booking->tenant_id,
-                fn () => $this->recordar($booking),
+                fn () => $this->recordar($booking, $contexto),
             );
 
             $enviados += $salio ? 1 : 0;
@@ -104,28 +114,109 @@ class EnviarRecordatorios extends Command
     }
 
     /**
+     * Lo que la corrida entera necesita saber, en tres consultas.
+     *
+     * ⚠️ **Acá se lee cross-tenant**, que es exactamente la forma en que se filtra
+     * el dato de una PyME a otra (RNF-01). El aislamiento no queda en la consulta
+     * sino en **la clave del mapa**: la conversación y la integración se guardan
+     * bajo `tenant_id|…`, así que un turno solo puede encontrar lo suyo. Es la
+     * misma garantía que daba el Global Scope adentro del `runAs()` —una fila de
+     * otra PyME daba `null`— y no una más laxa.
+     *
+     * El conjunto está acotado por **la misma ventana** que la corrida: los
+     * turnos de veinte minutos de toda la cartera, no la tabla entera.
+     *
+     * @param  Collection<int,Booking>  $turnos
+     * @return array{tenants:array<string,Tenant>,conversaciones:array<string,Conversation>,integraciones:array<string,Integration>}
+     */
+    private function contextoDe(Collection $turnos): array
+    {
+        $vacio = ['tenants' => [], 'conversaciones' => [], 'integraciones' => []];
+
+        // `tenant_id` es UUID: se compara como string y **nunca** con `(int)`.
+        $tenantIds = $turnos->pluck('tenant_id')
+            ->map(static fn ($id): string => (string) $id)
+            ->unique()->values()->all();
+
+        if ($tenantIds === []) {
+            return $vacio;
+        }
+
+        $conversationIds = $turnos->pluck('conversation_id')
+            ->filter()->unique()->values()->all();
+
+        $tenants = [];
+
+        foreach (Tenant::query()->whereIn('id', $tenantIds)->get() as $tenant) {
+            $tenants[(string) $tenant->id] = $tenant;
+        }
+
+        $conversaciones = [];
+
+        if ($conversationIds !== []) {
+            $filas = Conversation::withoutTenantScope()
+                ->whereIn('tenant_id', $tenantIds)
+                ->whereIn('id', $conversationIds)
+                ->get();
+
+            foreach ($filas as $conversacion) {
+                $conversaciones[$this->clave($conversacion->tenant_id, $conversacion->id)] = $conversacion;
+            }
+        }
+
+        $integraciones = [];
+
+        $filas = Integration::query()
+            ->whereIn('tenant_id', $tenantIds)
+            ->whereIn('provider', [
+                Integration::PROVIDER_META_WHATSAPP,
+                Integration::PROVIDER_GOOGLE_CALENDAR,
+            ])
+            // El `first()` que esto reemplaza no tenía orden: se fija uno para
+            // que dos integraciones del mismo proveedor elijan siempre la misma.
+            ->orderBy('id')
+            ->get();
+
+        foreach ($filas as $integracion) {
+            $integraciones[$this->clave($integracion->tenant_id, $integracion->provider)] ??= $integracion;
+        }
+
+        // Preguntarle a cada cuenta si sus plantillas están aprobadas ya no
+        // cuesta otra lectura: se acaban de traer, en esta misma corrida.
+        PlantillasDelTenant::precargar($integraciones);
+
+        return [
+            'tenants' => $tenants,
+            'conversaciones' => $conversaciones,
+            'integraciones' => $integraciones,
+        ];
+    }
+
+    /** La clave compuesta que impide que un turno alcance lo de otra PyME. */
+    private function clave(mixed $tenantId, mixed $parte): string
+    {
+        return (string) $tenantId.'|'.(string) $parte;
+    }
+
+    /**
+     * @param  array{tenants:array<string,Tenant>,conversaciones:array<string,Conversation>,integraciones:array<string,Integration>}  $contexto
      * @return bool  `true` solo si el cliente recibió el recordatorio.
      */
-    private function recordar(Booking $booking): bool
+    private function recordar(Booking $booking, array $contexto): bool
     {
-        $tenant = Tenant::find($booking->tenant_id);
-        $conversacion = Conversation::find($booking->conversation_id);
+        $tenant = $contexto['tenants'][(string) $booking->tenant_id] ?? null;
+        $conversacion = $contexto['conversaciones'][$this->clave($booking->tenant_id, $booking->conversation_id)] ?? null;
 
         /*
          * ⚠️ El emisor sale de la integración del tenant y **nunca** de
          * `config('services.meta.phone_number_id')`: con una variable global, el
          * recordatorio de la peluquería le llega al cliente desde el número del
-         * consultorio, y con un solo piloto no se nota.
+         * consultorio, y con un solo piloto no se nota. Que salga de un mapa no
+         * lo afloja: la clave lleva el `tenant_id` del propio turno adentro.
          */
-        $meta = Integration::query()
-            ->where('tenant_id', $booking->tenant_id)
-            ->where('provider', Integration::PROVIDER_META_WHATSAPP)
-            ->first();
+        $meta = $contexto['integraciones'][$this->clave($booking->tenant_id, Integration::PROVIDER_META_WHATSAPP)] ?? null;
 
-        $google = Integration::query()
-            ->where('tenant_id', $booking->tenant_id)
-            ->where('provider', Integration::PROVIDER_GOOGLE_CALENDAR)
-            ->first();
+        $google = $contexto['integraciones'][$this->clave($booking->tenant_id, Integration::PROVIDER_GOOGLE_CALENDAR)] ?? null;
 
         if ($tenant === null || $conversacion === null || $meta === null || $google === null) {
             // RNF-03 · Un turno que no se puede recordar no puede desaparecer

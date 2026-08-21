@@ -9,6 +9,7 @@ use App\Models\Integration;
 use App\Models\Tenant;
 use App\Support\TenantContext;
 use Illuminate\Console\Command;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -63,6 +64,21 @@ class SincronizarPlantillas extends Command
      */
     public const MINUTOS_ENTRE_CORRIDAS = 15;
 
+    /**
+     * Cuántas PyMEs se resuelven de una vez.
+     *
+     * El `cursor()` que había acá traía los tenants de a uno y después preguntaba
+     * la integración de cada uno: una lectura por PyME por corrida, cada quince
+     * minutos, y en régimen —las tres plantillas aprobadas— **para no enterarse
+     * de nada**. Ahora el lote se resuelve con una sola consulta.
+     *
+     * Es un lote y no un `whereIn` sobre la cartera entera a propósito: el
+     * recorrido no tiene ventana que lo acote —son todas las PyMEs— y traer todas
+     * sus integraciones juntas cambiaría un problema de consultas por uno de
+     * memoria.
+     */
+    private const PYMES_POR_LOTE = 200;
+
     public function handle(EstadoDePlantillasEnMeta $estado): int
     {
         $sincronizadas = 0;
@@ -76,43 +92,48 @@ class SincronizarPlantillas extends Command
          * el `id` de desempate porque dos altas del mismo segundo empatan— para
          * que la corrida sea reproducible.
          */
-        foreach (Tenant::query()->orderBy('created_at')->orderBy('id')->cursor() as $tenant) {
-            $meta = Integration::query()
-                ->where('tenant_id', $tenant->id)
-                ->where('provider', Integration::PROVIDER_META_WHATSAPP)
-                ->first();
+        $recorrido = Tenant::query()->orderBy('created_at')->orderBy('id');
 
-            /*
-             * Sin cuenta de WhatsApp cargada no hay dónde consultar. No es un
-             * fallo: es una PyME a la que todavía no le corrieron el alta.
-             */
-            if ($meta === null || ! AltaDeCuenta::tieneCuenta($meta)) {
-                $salteadas++;
+        $recorrido->chunk(self::PYMES_POR_LOTE, function ($tenants) use (
+            $estado, &$sincronizadas, &$salteadas, &$fallidas
+        ): void {
+            $cuentas = $this->cuentasDeWhatsApp($tenants);
 
-                continue;
+            foreach ($tenants as $tenant) {
+                $meta = $cuentas[(string) $tenant->id] ?? null;
+
+                /*
+                 * Sin cuenta de WhatsApp cargada no hay dónde consultar. No es un
+                 * fallo: es una PyME a la que todavía no le corrieron el alta.
+                 */
+                if ($meta === null || ! AltaDeCuenta::tieneCuenta($meta)) {
+                    $salteadas++;
+
+                    continue;
+                }
+
+                /*
+                 * `APPROVED` es terminal para lo que decide el envío: consultar a la
+                 * PyME que ya tiene las tres es una llamada por tenant en cada
+                 * corrida para no enterarse de nada, contra la misma cuota de Meta
+                 * que usa el camino crítico del cliente.
+                 */
+                if (PlantillasDelTenant::todasAprobadas($meta)) {
+                    $salteadas++;
+
+                    continue;
+                }
+
+                // Un comando no hereda el tenant: se aplica antes de tocar nada suyo
+                // (RNF-01).
+                $ok = TenantContext::runAs(
+                    (string) $tenant->id,
+                    fn (): bool => $this->sincronizarTenant($estado, $tenant, $meta),
+                );
+
+                $ok ? $sincronizadas++ : $fallidas++;
             }
-
-            /*
-             * `APPROVED` es terminal para lo que decide el envío: consultar a la
-             * PyME que ya tiene las tres es una llamada por tenant en cada
-             * corrida para no enterarse de nada, contra la misma cuota de Meta
-             * que usa el camino crítico del cliente.
-             */
-            if (PlantillasDelTenant::todasAprobadas($meta)) {
-                $salteadas++;
-
-                continue;
-            }
-
-            // Un comando no hereda el tenant: se aplica antes de tocar nada suyo
-            // (RNF-01).
-            $ok = TenantContext::runAs(
-                (string) $tenant->id,
-                fn (): bool => $this->sincronizarTenant($estado, $tenant, $meta),
-            );
-
-            $ok ? $sincronizadas++ : $fallidas++;
-        }
+        });
 
         $this->info("Plantillas sincronizadas: {$sincronizadas} · PyMEs salteadas: {$salteadas} "
             ."· fallidas: {$fallidas}");
@@ -125,6 +146,46 @@ class SincronizarPlantillas extends Command
          * que falle de verdad tampoco la va a mirar nadie.
          */
         return self::SUCCESS;
+    }
+
+    /**
+     * La cuenta de WhatsApp de cada PyME del lote, en una sola consulta.
+     *
+     * ⚠️ Lectura cross-tenant, como todo lo demás de esta tarea de plataforma. El
+     * aislamiento lo da el mapa: se indexa por `tenant_id` y cada PyME solo
+     * alcanza la entrada de su propio id, que es UUID y se compara como string
+     * (RNF-01).
+     *
+     * @param  Collection<int,Tenant>  $tenants
+     * @return array<string,Integration>
+     */
+    private function cuentasDeWhatsApp(Collection $tenants): array
+    {
+        $ids = $tenants->pluck('id')->map(static fn ($id): string => (string) $id)->all();
+
+        if ($ids === []) {
+            return [];
+        }
+
+        $cuentas = [];
+
+        $filas = Integration::query()
+            ->whereIn('tenant_id', $ids)
+            ->where('provider', Integration::PROVIDER_META_WHATSAPP)
+            // El `first()` que esto reemplaza no tenía orden: se fija uno para que
+            // la PyME con dos cuentas cargadas elija siempre la misma.
+            ->orderBy('id')
+            ->get();
+
+        foreach ($filas as $integracion) {
+            $cuentas[(string) $integracion->tenant_id] ??= $integracion;
+        }
+
+        // Recién leídas de la base en esta corrida: preguntarles el estado de sus
+        // plantillas no tiene por qué costar otra lectura por PyME.
+        PlantillasDelTenant::precargar($cuentas);
+
+        return $cuentas;
     }
 
     /**

@@ -7,6 +7,7 @@ use App\Http\Controllers\Panel\ConfiguracionPlanillaController;
 use App\Http\Controllers\Panel\ConversacionesController;
 use App\Http\Controllers\Panel\LoginController;
 use App\Http\Controllers\Panel\RecordatoriosFallidosController;
+use App\Http\Controllers\Panel\TurnosEnDudaController;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/', function () {
@@ -109,6 +110,24 @@ Route::middleware(['auth', 'avisos-de-integracion'])->prefix('panel')->group(fun
             ->name('panel.recordatorios-fallidos');
         Route::post('{registro}/reintentar', [RecordatoriosFallidosController::class, 'reintentar'])
             ->name('panel.recordatorios-fallidos.reintentar');
+    });
+
+    /*
+     * § 8 y § 9 · Turnos en duda: el evento ya no está en el Google Calendar del
+     * dueño y una persona decide si el turno va o no.
+     *
+     * Va con `rol:atender` y no con `rol:configurar`, por el mismo motivo que la
+     * asistencia y los recordatorios fallidos: quien sabe si ese turno va es la
+     * persona que está en el mostrador y que puede llamar al cliente desde el
+     * número de atención humana. Si esto exigiera configurar, la bandeja la
+     * atendería quien no tiene el dato y se llenaría hasta que nadie la mire.
+     * Definición: `.claude/docs/01-producto/05-roles-y-permisos.md`
+     */
+    Route::middleware('rol:atender')->prefix('turnos-en-duda')->group(function () {
+        Route::get('/', [TurnosEnDudaController::class, 'index'])
+            ->name('panel.turnos-en-duda');
+        Route::post('{hallazgo}/resolver', [TurnosEnDudaController::class, 'resolver'])
+            ->name('panel.turnos-en-duda.resolver');
     });
 
     /*
