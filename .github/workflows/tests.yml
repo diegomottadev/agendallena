@@ -1,0 +1,71 @@
+# T-031 · criterio 5 · La suite corre en integracion continua y el build falla si
+# alguno de los cuatro criterios de husos se rompe.
+#
+# ## Por que se construye la imagen del proyecto y no se usa `setup-php`
+#
+# Un runner con PHP instalado por accion trae **la tzdata del runner**, y la
+# version de tzdata es parte del contrato de T-031: el `Dockerfile` la fija a
+# proposito porque Chile movio su cambio estacional en 2022 y Paraguay lo elimino
+# en 2024. Con la base de otro origen, los tests de husos pasan o fallan por una
+# razon que no es la del producto — que es exactamente el modo de falla que T-031
+# existe para cerrar. Correr dentro de la imagen del proyecto ademas verifica que
+# el `Dockerfile` sigue construyendo.
+#
+# ⚠️ El `php` de un runner tampoco sirve por lo mismo que no sirve el de Windows:
+# el proyecto exige 8.4 y el `platform_check` de Composer aborta con cualquier
+# otro.
+
+name: tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    name: Suite completa (PHP 8.4 · MySQL 8.4 · Redis 7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # `phpunit.xml` fija el nombre de la base de tests, pero hereda host y
+      # credenciales del `.env`. Sin este paso la suite se conecta a ningun lado.
+      - name: Preparar el entorno
+        run: cp .env.example .env
+
+      - name: Levantar mysql y redis
+        run: docker compose up -d --wait mysql redis
+
+      # El worker no se levanta: la suite encola con `Queue::fake()` o procesa en
+      # linea, y un worker real compitiendo por los jobs vuelve los tests
+      # intermitentes.
+      - name: Construir la imagen de la aplicacion
+        run: docker compose build app
+
+      - name: Instalar dependencias
+        run: docker compose run --rm --no-deps app composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Generar APP_KEY
+        run: docker compose run --rm --no-deps app php artisan key:generate
+
+      # `agendallena_testing` la crea `docker/mysql/init/` al inicializar el
+      # volumen, y `RefreshDatabase` corre las migraciones en cada test.
+      - name: Correr la suite
+        run: docker compose run --rm app php artisan test
+
+      # Se corre aparte y despues de la suite: si los cuatro criterios de husos se
+      # rompen, el log dice "husos" y no "428 tests" — que es la diferencia entre
+      # un build rojo que se lee y uno que se ignora.
+      - name: Husos horarios (AC-07.1 a AC-07.4)
+        run: docker compose run --rm app php artisan test --filter=ZonasHorariasTransversalTest
+
+      - name: Bajar todo
+        if: always()
+        run: docker compose down -v

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor/autoload.php"
+         colors="true"
+>
+    <testsuites>
+        <testsuite name="Unit">
+            <directory>tests/Unit</directory>
+        </testsuite>
+        <testsuite name="Feature">
+            <directory>tests/Feature</directory>
+        </testsuite>
+    </testsuites>
+    <source>
+        <include>
+            <directory>app</directory>
+        </include>
+    </source>
+    <php>
+        <env name="APP_ENV" value="testing"/>
+        <env name="APP_MAINTENANCE_DRIVER" value="file"/>
+        <env name="BCRYPT_ROUNDS" value="4"/>
+        <env name="BROADCAST_CONNECTION" value="null"/>
+        <env name="CACHE_STORE" value="array"/>
+        <!--
+            Los tests corren contra MySQL 8.4, el mismo motor que produccion, en
+            una base aparte. Antes usaban SQLite en memoria: mas rapido, pero un
+            test verde ahi no probaba nada sobre los indices compuestos de T-009,
+            los ENUM, `ON UPDATE CURRENT_TIMESTAMP` ni el bloqueo de filas que
+            T-011 y T-018 necesitan.
+
+            La base la crea `docker/mysql/init/01-create-testing-db.sql`.
+            DB_HOST, DB_PORT y las credenciales se heredan del .env: aca solo se
+            cambia a que base apunta, para no tocar nunca `agendallena`.
+        -->
+        <env name="DB_CONNECTION" value="mysql"/>
+        <env name="DB_DATABASE" value="agendallena_testing"/>
+        <env name="DB_URL" value=""/>
+        <!--
+            Redis en un indice distinto del de desarrollo: un `cache:clear` o un
+            flush de la suite no puede llevarse por delante las colas o las
+            sesiones con las que estas laburando.
+        -->
+        <env name="REDIS_DB" value="15"/>
+        <env name="REDIS_CACHE_DB" value="14"/>
+        <env name="MAIL_MAILER" value="array"/>
+        <env name="QUEUE_CONNECTION" value="sync"/>
+        <env name="SESSION_DRIVER" value="array"/>
+        <env name="PULSE_ENABLED" value="false"/>
+        <env name="TELESCOPE_ENABLED" value="false"/>
+        <env name="NIGHTWATCH_ENABLED" value="false"/>
+    </php>
+</phpunit>

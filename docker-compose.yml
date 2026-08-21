@@ -1,0 +1,63 @@
+services:
+  app:
+    build: .
+    command: php artisan serve --host=0.0.0.0 --port=8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/var/www/html
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # El worker existe desde el dia 1: RF-A2 exige que el webhook responda 200
+  # antes de procesar, y sin worker la cola se llena y nada avanza.
+  worker:
+    build: .
+    command: php artisan queue:work --tries=3 --backoff=5
+    volumes:
+      - .:/var/www/html
+    depends_on:
+      app:
+        condition: service_started
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: agendallena
+      MYSQL_USER: agendallena
+      MYSQL_PASSWORD: secret
+      MYSQL_ROOT_PASSWORD: secret
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # Crea `agendallena_testing` al inicializar el volumen. Los tests corren
+      # contra el mismo motor que produccion, no contra SQLite.
+      # Solo se ejecuta con el volumen vacio; sobre uno existente hay que
+      # aplicarlo a mano (ver el encabezado del .sql).
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-psecret"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  mysql-data:
+  redis-data:

@@ -1,0 +1,50 @@
+*.log
+.DS_Store
+.env
+.env.backup
+.env.production
+.phpactor.json
+.phpunit.result.cache
+/.codex
+/.cursor/
+/.idea
+/.nova
+/.phpunit.cache
+# La config del linter es del proyecto, no de una maquina: sin ella, cualquiera
+# que abra el repo con el PHP viejo en el PATH ve errores de sintaxis falsos.
+/.vscode/*
+!/.vscode/settings.json
+
+# Grafo de conocimiento generado por /graphify. Es salida DERIVADA del codigo y
+# de la documentacion, y se regenera con un comando.
+#
+# No se versiona a proposito: el problema recurrente de este proyecto es
+# documentacion que contradice al codigo (el DDL que declaraba indices
+# inexistentes, `users.id` UUID contra bigint, "Laravel 11" con 13 instalado).
+# Un grafo committeado seria un documento mas quedando viejo, con el agravante
+# de que parece autoritativo. Regenerarlo cuesta un comando.
+/graphify-out
+# Intermedios que /graphify deja sueltos en la raiz durante la corrida.
+/.graphify_*
+/.zed
+/auth.json
+/node_modules
+/public/build
+/public/fonts-manifest.dev.json
+/public/hot
+/public/storage
+/storage/*.key
+/storage/pail
+/vendor
+_ide_helper.php
+# Transcripciones de sesiones de Claude Code: arrastran credenciales pegadas en
+# el chat (verify_token, tokens de Meta) y no son documentacion del producto.
+CC-Session-Logs/
+Homestead.json
+Homestead.yaml
+Thumbs.db
+
+# Configuracion, documentacion y agentes de Claude Code. Excluidos a pedido:
+# no se publican en el repositorio.
+/.claude/
+/CLAUDE.md

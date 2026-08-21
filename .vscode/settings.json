@@ -1,0 +1,39 @@
+{
+  // Configuracion de workspace: aplica SOLO a este proyecto.
+  // No toca tus settings globales ni tus otros proyectos con PHP viejo.
+  //
+  // Problema que resuelve: en el PATH de Windows el `php` es 7.4.1
+  // (C:\xampp74\php\php.exe). Este proyecto corre PHP 8.4.24 dentro de Docker
+  // (imagen php:8.4-cli). Con el linter apuntado al 7.4, codigo valido de 8.x
+  // aparece como error de sintaxis: promocion de propiedades en constructor
+  // (8.0), `readonly` (8.1), tipos en propiedades, enums, etc.
+
+  // Intelephense analiza con esta version. NO necesita un binario local de PHP:
+  // le alcanza con la cadena de version, asi que funciona aunque el unico PHP
+  // instalado en Windows sea el 7.4.
+  "intelephense.environment.phpVersion": "8.4.24",
+
+  // El validador de sintaxis nativo de VS Code SI ejecuta un binario, y el unico
+  // disponible localmente es el 7.4 — que es exactamente el que produce los
+  // falsos positivos. Se apaga: Intelephense ya cubre el analisis, y la
+  // verificacion real de sintaxis se hace contra la imagen con
+  //   docker compose exec -T app php -l <archivo>
+  "php.validate.enable": false,
+
+  // Si usas la extension DEVSENSE PHP en vez de Intelephense, esta es su
+  // equivalente. Sobra si no la tenes instalada.
+  "php.version": "8.4",
+
+  // Evita que el indexador se coma tiempo en carpetas que no son codigo fuente.
+  "intelephense.files.exclude": [
+    "**/node_modules/**",
+    "**/vendor/**/{Tests,tests}/**",
+    "**/storage/framework/**",
+    "**/.git/**"
+  ],
+
+  "[php]": {
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4
+  }
+}
