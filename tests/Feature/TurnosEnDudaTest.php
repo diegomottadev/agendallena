@@ -740,4 +740,71 @@ class TurnosEnDudaTest extends TestCase
         $this->assertSame($ajena->id, (string) ($this->cruzados[0]['tenant_id_objetivo'] ?? ''),
             'El registro no dice a qué PyME se intentó entrar.');
     }
+
+    // ------------------------------------------------------- quién resuelve
+
+    /**
+     * **Un `staff` puede resolver un turno en duda.**
+     *
+     * Es el mismo criterio que sostienen `asistencia`, `recordatorios-fallidos`
+     * y la pausa desde el panel: va con `rol:atender` y no con `rol:configurar`,
+     * porque **quien está en el mostrador es quien sabe si el turno va**. Un
+     * desalineado que solo puede resolver el dueño se queda sin resolver los
+     * días que el dueño no entra — y cada uno es un cliente que aparece en la
+     * puerta o un horario que nadie recupera.
+     *
+     * ⚠️ Este test se escribe porque el comportamiento **ya era el correcto y no
+     * lo protegía nada**: los nueve tests del archivo usan `owner`, que puede
+     * todo, así que endurecer la ruta a `rol:configurar` los dejaba a los nueve
+     * en verde. Es la misma forma de los defectos que aparecieron todo el día —
+     * código correcto sin cobertura.
+     */
+    public function test_un_staff_puede_resolver_un_turno_en_duda(): void
+    {
+        // Sin el doble, la conciliación no ve ningún calendario y no hay hallazgo
+        // que resolver: el test pasaría a medir otra cosa.
+        $this->fakeDeGoogle();
+
+        $tenant = $this->tenant();
+        $staff = $this->usuario($tenant, Role::Staff);
+
+        $turno = $this->turnoSinEvento($tenant);
+        $this->conciliar();
+
+        $hallazgo = $this->hallazgoDe($turno);
+        $this->assertNotNull($hallazgo,
+            'Precondición: la conciliación no dejó el hallazgo, así que no hay nada que resolver.');
+
+        $respuesta = $this->resolver($staff, $hallazgo->id, 'mantener');
+
+        $this->assertNotSame(403, $respuesta->status(),
+            'Un staff no pudo resolver un turno en duda: atender no es configurar. Quien está en '
+            .'el mostrador es quien sabe si ese turno va.');
+
+        $this->assertNotNull($this->hallazgoDe($turno)?->resolved_at,
+            'El staff resolvió y el hallazgo sigue pendiente: va a volver a aparecer en la bandeja.');
+    }
+
+    /** Y también lo **ve**: resolver algo que no aparece en la pantalla no sirve de nada. */
+    public function test_un_staff_ve_la_pantalla_de_turnos_en_duda(): void
+    {
+        // Sin el doble, la conciliación no ve ningún calendario y no hay hallazgo
+        // que resolver: el test pasaría a medir otra cosa.
+        $this->fakeDeGoogle();
+
+        $tenant = $this->tenant();
+        $staff = $this->usuario($tenant, Role::Staff);
+
+        $this->turnoSinEvento($tenant);
+        $this->conciliar();
+
+        $respuesta = $this->actingAs($staff)->get(self::PANEL);
+
+        $this->assertNotSame(403, $respuesta->status(),
+            'Un staff no puede abrir la pantalla de turnos en duda, así que no puede resolver lo '
+            .'que sí tiene permiso de resolver.');
+
+        $this->assertNotEmpty($this->hallazgosDeLaVista($respuesta),
+            'La pantalla abrió para el staff pero sin el hallazgo pendiente: lo mismo que no verla.');
+    }
 }
