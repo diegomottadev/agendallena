@@ -62,25 +62,6 @@ Alrededor: panel Vue para el dueño (conversaciones, configuración de agenda y 
 
 ---
 
-## Qué te vas a encontrar acá
-
-| Ruta | Qué hay | Para quién |
-| :-- | :-- | :-- |
-| [`app/Conversacion/`](app/Conversacion) | Máquina de estados, tabla de transiciones, mensajes interactivos de Meta | Programador |
-| [`app/Services/Google/`](app/Services/Google) | Calendar, OAuth, renovación de tokens, clave de idempotencia, Sheets | Programador |
-| [`app/Meta/`](app/Meta) | Cloud API, plantillas, alta de cuenta por PyME, rate limit | Programador |
-| [`app/Console/Commands/`](app/Console/Commands) | Recordatorios, conciliación, expiración de conversaciones, sincronización de plantillas | Programador |
-| [`tests/Feature/`](tests/Feature) | La suite. Un archivo por comportamiento, nombrado en castellano | Programador |
-| [`.claude/docs/01-producto/`](.claude/docs/01-producto) | Lean canvas, PRD con requisitos funcionales, no funcionales y criterios de aceptación | CEO · Producto |
-| [`.claude/docs/02-arquitectura/`](.claude/docs/02-arquitectura) | C4 nivel 2 y 3, DER, modelo de datos con DDL | Arquitectura |
-| [`.claude/docs/tickets/`](.claude/docs/tickets) | 51 tickets con criterios de aceptación y auditoría INVEST | Tech lead |
-| [`.claude/docs/estimacion-backlog/`](.claude/docs/estimacion-backlog) | 177 puntos, plan de capacidad y el **análisis Pareto** que recortó el MVP a su núcleo | CEO · Tech lead |
-| [`.claude/docs/plan-for-diego/`](.claude/docs/plan-for-diego) | Las decisiones de negocio que frenaban tickets, y **cómo se resolvió cada una** | CEO |
-
-**Empezá por [`.claude/docs/README.md`](.claude/docs/README.md)** — es el índice maestro de toda la documentación.
-
----
-
 ## Las decisiones que definen este código
 
 Son las que un desarrollador senior mira para saber con qué se va a encontrar. Todas están comentadas en el archivo donde viven.
