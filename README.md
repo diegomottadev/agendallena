@@ -54,10 +54,21 @@ Around it: a Vue panel for the owner (conversations, schedule and message settin
 
 ## Why I built it
 
-**Because it's a real software problem disguised as CRUD.** A scheduler looks like a form until you run into: two customers picking the same slot seconds apart, a third party failing halfway through a distributed transaction that can't be a transaction, several businesses sharing the same database without ever being able to see each other, and time zones that change by decree and shift an appointment by an hour **without throwing a single error**.
+**Because it's a real software problem disguised as CRUD.** A scheduler looks like a form until you run into cases like these:
 
-**Because I wanted a piece where judgment shows instead of being claimed.** It's easy to write "I do TDD" on a CV. Here is the repository: every hard decision has its reasoning written **in the code, right next to the line that implements it**, and the ones not yet made are marked with ⚠️ instead of being filled in with an assumption.
+- 2 customers picking the same slot seconds apart.
+- A third party failing halfway through a distributed transaction that can't be a transaction.
+- Several businesses sharing one database, and none of them can ever see the others' data.
+- Time zones that change by decree and shift an appointment by an hour **without throwing a single error**.
 
-**Because I wanted to put Spec-Driven Development into practice.** This project is, above all, where I applied what I learned about AI-assisted Spec-Driven Development (SDD) in the [LIDR AI for Devs master's program](https://www.lidr.co/ia-devs/). The specification comes first and the code is derived from it: PRD, architecture and flows → story maps → user stories → tickets with acceptance criteria → tests → implementation. AI agents work inside that chain, each one limited to its own step, and each step traces back to the previous one by ID.
+**Because I wanted a project where you can see my judgment in the code.** Every hard decision has its reasoning written right next to the line that implements it. The decisions I haven't made yet are marked with ⚠️, so nobody mistakes a guess for a decision.
 
-**Because it's sellable.** It's not only a learning exercise: there's a lean canvas, a PRD, a story map, 50 estimated tickets and a pilot plan. The goal is to bill for it.
+**Because I wanted to put Spec-Driven Development into practice.** This is where I applied what I learned about AI-assisted SDD in the [LIDR AI for Devs master's program](https://www.lidr.co/ia-devs/). I write the spec first and derive the code from it:
+
+```
+PRD, architecture and flows → story maps → user stories → tickets with acceptance criteria → tests → implementation
+```
+
+AI agents work inside that chain, each one locked to its own step. Every step traces back to the previous one by ID.
+
+**Because I plan to sell it.** There's a lean canvas, a PRD, a story map, 50 estimated tickets and a pilot plan. The goal is to bill for it.
