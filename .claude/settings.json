@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "defaultMode": "auto",
+    "allow": [
+      "Bash(docker compose:*)",
+      "Bash(MSYS_NO_PATHCONV=1 docker compose:*)",
+      "Bash(docker info:*)",
+      "Bash(docker ps:*)",
+      "Bash(docker images:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git show:*)",
+      "Bash(php artisan:*)",
+      "Bash(composer:*)",
+      "Bash(cloudflared:*)",
+      "Bash(ngrok:*)",
+      "Bash(curl:*)"
+    ],
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(docker compose down -v:*)",
+      "Bash(rm -rf:*)",
+      "Read(./.env)"
+    ]
+  }
+}

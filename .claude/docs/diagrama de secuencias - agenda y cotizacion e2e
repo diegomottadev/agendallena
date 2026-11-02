@@ -1,0 +1,31 @@
+sequenceDiagram
+    autonumber
+    actor User as Cliente (WhatsApp)
+    participant WA as Meta Cloud API
+    participant Webhook as Laravel Webhook Controller
+    participant Queue as Redis / Worker Queue
+    participant Engine as Conversation Engine (State Machine)
+    participant GC as Google Calendar API
+    participant DB as MySQL DB
+
+    User->>WA: Envía mensaje "Quiero turno"
+    WA->>Webhook: POST /api/v1/webhooks/whatsapp
+    Webhook->>Queue: Dispatch ProcessWhatsAppMessageJob
+    Webhook-->>WA: 200 OK (< 200ms)
+    Queue->>Engine: Process Message
+    Engine->>DB: Fetch/Create Conversation State
+    Engine->>GC: Query FreeBusy Slots (OAuth)
+    GC-->>Engine: Return Available Slots
+    Engine->>DB: Update State to 'SELECTING_SLOT'
+    Engine->>WA: Send Interactive List (Buttons with Slots)
+    WA-->>User: Muestra Botones con Horarios
+
+    User->>WA: Selecciona "Mañana 15:00 hs"
+    WA->>Webhook: POST Webhook (Interactive Response)
+    Webhook->>Queue: Dispatch Job
+    Queue->>Engine: Process Slot Selection
+    Engine->>GC: Create Event (Book Slot)
+    GC-->>Engine: Event Created (ID, Link)
+    Engine->>DB: Persist Booking & Reset State
+    Engine->>WA: Send Confirmation Message
+    WA-->>User: "¡Turno confirmado para mañana a las 15:00!"

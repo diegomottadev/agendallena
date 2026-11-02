@@ -44,7 +44,5 @@ Homestead.json
 Homestead.yaml
 Thumbs.db
 
-# Configuracion, documentacion y agentes de Claude Code. Excluidos a pedido:
-# no se publican en el repositorio.
-/.claude/
-/CLAUDE.md
+# Configuracion local de Claude Code: permisos propios de cada maquina.
+/.claude/settings.local.json
